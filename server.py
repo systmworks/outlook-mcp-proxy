@@ -18,8 +18,9 @@ import secrets
 import time
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 import jwt
@@ -104,9 +105,9 @@ ME = f"{GRAPH}/me"
 # usually transient. Other 4xx (403/404, etc.) are permanent.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-# Total attempts (including the first) for a write-tool API call before giving up.
-# A bulk operation otherwise fails outright the moment Graph rate-limits a single
-# call, with no chance to recover.
+# Total attempts (including the first) for an outbound Graph API call before giving
+# up. A bulk operation otherwise fails outright the moment Graph rate-limits a
+# single call, with no chance to recover.
 API_RETRY_ATTEMPTS = max(1, min(5, int(os.environ.get("API_RETRY_ATTEMPTS", "2"))))
 _API_RETRY_DELAY = 0.3  # seconds between attempts, unless Retry-After says otherwise
 
@@ -133,7 +134,6 @@ _refresh_locks: dict[str, asyncio.Lock] = {}  # jti → lock guarding concurrent
 # ── Per-request context ────────────────────────────────────────────────────────
 
 _session_jti: ContextVar[str] = ContextVar("session_jti", default="")
-_user_email: ContextVar[str] = ContextVar("user_email", default="")
 _read_only: ContextVar[bool] = ContextVar("read_only", default=False)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -177,6 +177,15 @@ def _purge_expired_tokens() -> None:
     now = time.time()
     expired = [jti for jti, d in _token_store.items() if now >= d.get("jwt_exp", float("inf"))]
     for jti in expired:
+        lock = _refresh_locks.get(jti)
+        if lock is not None and lock.locked():
+            # A refresh is in-flight for this session right now (e.g. this purge
+            # was triggered by a completely unrelated concurrent request). Popping
+            # the entry out from under it would let _refresh write a "successful"
+            # refresh into a dict that's no longer in the store, silently losing
+            # the session. Leave it — the next purge pass will catch it once the
+            # refresh finishes and releases the lock, assuming jwt_exp is still past.
+            continue
         _token_store.pop(jti, None)
         _refresh_locks.pop(jti, None)
 
@@ -192,8 +201,7 @@ async def _refresh(jti: str) -> str:
         if time.time() < d["expiry"] - 60:
             # Another coroutine already refreshed while we waited on the lock.
             return d["access_token"]
-        c = _client()
-        r = await c.post(MS_TOKEN_URL, data={
+        r = await _request_with_retry("POST", MS_TOKEN_URL, data={
             "client_id": MS_CLIENT_ID,
             "client_secret": MS_CLIENT_SECRET,
             "refresh_token": d["refresh_token"],
@@ -246,35 +254,46 @@ async def _auth() -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _parse_retry_after(value: str) -> float | None:
+    """Parse a Retry-After header value in either form RFC 7231 allows: a
+    delay-seconds integer, or an HTTP-date. Returns None if neither parses."""
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return (when - datetime.now(UTC)).total_seconds()
+
+
 async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Response:
-    """Write-tool API call with retry — up to API_RETRY_ATTEMPTS total tries on
-    network errors or retryable statuses (429, 5xx) before giving up, honoring a
-    Retry-After response header when Graph sends one. Callers keep calling
-    r.raise_for_status() as before: a final retryable-status response is returned
-    as-is (so that still raises), a final network error is re-raised."""
+    """Graph API call with retry — up to API_RETRY_ATTEMPTS total tries on
+    retryable statuses (429, 5xx) before giving up, honoring a Retry-After
+    response header (delay-seconds or HTTP-date) when Graph sends one. Used for
+    both read and write calls. A network-level error (timeout, connection reset)
+    is NOT retried and propagates immediately — whether the request already
+    landed server-side is ambiguous, and blindly retrying a non-idempotent write
+    (e.g. sendMail) risks duplicating it. Callers keep calling r.raise_for_status()
+    as before: a final retryable-status response is returned as-is (so that still
+    raises)."""
     c = _client()
-    last_exc: httpx.HTTPError | None = None
     r: httpx.Response | None = None
     for attempt in range(1, API_RETRY_ATTEMPTS + 1):
-        try:
-            r = await c.request(method, url, **kwargs)
-            last_exc = None
-        except httpx.HTTPError as e:
-            last_exc = e
-            r = None
-        if r is not None and r.status_code not in _RETRYABLE_STATUSES:
+        r = await c.request(method, url, **kwargs)
+        if r.status_code not in _RETRYABLE_STATUSES:
             return r
         if attempt < API_RETRY_ATTEMPTS:
             delay = _API_RETRY_DELAY
-            retry_after = r.headers.get("Retry-After") if r is not None else None
+            retry_after = r.headers.get("Retry-After")
             if retry_after is not None:
-                try:
-                    delay = max(delay, float(retry_after))
-                except ValueError:
-                    pass
+                parsed = _parse_retry_after(retry_after)
+                if parsed is not None:
+                    delay = max(delay, parsed)
             await asyncio.sleep(delay)
-    if last_exc is not None:
-        raise last_exc
     assert r is not None
     return r
 
@@ -305,12 +324,45 @@ def _alias_from_resource(resource: str | None) -> str:
     return ""
 
 
+def _enc(value: str) -> str:
+    """URL-encode a value for safe interpolation into a Graph REST path segment.
+    Graph entity ids are documented to sometimes contain '/' (a reserved path
+    delimiter) — without this, such an id would split the request onto an
+    unintended path instead of addressing the resource it names."""
+    return quote(value, safe="")
+
+
+def _escape_search_phrase(value: str) -> str:
+    """Graph's $search syntax delimits phrases with double quotes; strip any
+    embedded quote so a crafted value can't break out of the phrase and be
+    parsed as a separate, unintended search clause (e.g. 'foo\" OR \"bar')."""
+    return value.replace('"', "")
+
+
+def _escape_odata_literal(value: str) -> str:
+    """OData string literals are single-quoted; the standard escape for an
+    embedded quote is to double it, so a crafted value can't break out of the
+    literal and alter the rest of the $filter expression."""
+    return value.replace("'", "''")
+
+
 def _parse_recipients(addresses: str) -> list[dict]:
     return [{"emailAddress": {"address": a.strip()}} for a in addresses.split(",") if a.strip()]
 
 
+def _build_message(subject: str, body: str, to: str, cc: str = "") -> dict:
+    message: dict = {
+        "subject": subject,
+        "body": {"contentType": "Text", "content": body},
+        "toRecipients": _parse_recipients(to),
+    }
+    if cc:
+        message["ccRecipients"] = _parse_recipients(cc)
+    return message
+
+
 def _calendar_base(calendar_id: str) -> str:
-    return ME if calendar_id == "primary" else f"{ME}/calendars/{calendar_id}"
+    return ME if calendar_id == "primary" else f"{ME}/calendars/{_enc(calendar_id)}"
 
 
 # ── FastMCP tools ──────────────────────────────────────────────────────────────
@@ -321,9 +373,8 @@ mcp = FastMCP("Outlook MCP")
 @mcp.tool
 async def get_profile() -> dict:
     """Get the authenticated Outlook account's profile."""
-    c = _client()
-    r = await c.get(ME, headers=await _auth(),
-                    params={"$select": "id,displayName,mail,userPrincipalName"})
+    r = await _request_with_retry("GET", ME, headers=await _auth(),
+                                  params={"$select": "id,displayName,mail,userPrincipalName"})
     r.raise_for_status()
     return r.json()
 
@@ -335,9 +386,8 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     the same syntax). Each hit already includes from/subject/receivedDateTime/
     preview/categories/hasAttachments in this one call — no separate enrichment
     round-trip needed, unlike the Gmail equivalent."""
-    c = _client()
-    r = await c.get(f"{ME}/messages", headers=await _auth(), params={
-        "$search": f'"{query}"',
+    r = await _request_with_retry("GET", f"{ME}/messages", headers=await _auth(), params={
+        "$search": f'"{_escape_search_phrase(query)}"',
         "$top": max_results,
         "$select": "id,conversationId,subject,from,toRecipients,receivedDateTime,"
                    "bodyPreview,hasAttachments,categories,parentFolderId",
@@ -361,15 +411,15 @@ async def read_message(message_id: str) -> dict:
     """Read an Outlook message by ID. Returns headers, body (already-decoded
     content — Graph gives plain/HTML text directly, no MIME/base64 decoding
     needed), and attachment metadata (use get_attachment to download bytes)."""
-    c = _client()
-    r = await c.get(f"{ME}/messages/{message_id}", headers=await _auth())
+    r = await _request_with_retry("GET", f"{ME}/messages/{_enc(message_id)}", headers=await _auth())
     r.raise_for_status()
     data = r.json()
 
     attachments: list[dict] = []
     if data.get("hasAttachments"):
-        ar = await c.get(f"{ME}/messages/{message_id}/attachments", headers=await _auth(),
-                         params={"$select": "id,name,contentType,size,isInline"})
+        ar = await _request_with_retry("GET", f"{ME}/messages/{_enc(message_id)}/attachments",
+                                       headers=await _auth(),
+                                       params={"$select": "id,name,contentType,size,isInline"})
         ar.raise_for_status()
         attachments = [_attachment_summary(a) for a in ar.json().get("value", [])
                        if not a.get("isInline")]
@@ -397,9 +447,8 @@ async def read_conversation(conversation_id: str) -> list[dict]:
     """Read all messages in a conversation (Outlook's equivalent of a Gmail
     thread), oldest first. Graph has no single "get whole thread" call, so this
     lists messages filtered by conversationId."""
-    c = _client()
-    r = await c.get(f"{ME}/messages", headers=await _auth(), params={
-        "$filter": f"conversationId eq '{conversation_id}'",
+    r = await _request_with_retry("GET", f"{ME}/messages", headers=await _auth(), params={
+        "$filter": f"conversationId eq '{_escape_odata_literal(conversation_id)}'",
         "$orderby": "receivedDateTime asc",
         "$select": "id,conversationId,subject,from,toRecipients,receivedDateTime,"
                    "bodyPreview,hasAttachments,categories,parentFolderId",
@@ -415,9 +464,9 @@ async def get_attachment(message_id: str, attachment_id: str) -> dict:
     attachment ids are stable across repeated reads of the same message, so the
     id read_message returned earlier can always be reused here. Rejects
     attachments larger than ATTACHMENT_MAX_MB without downloading their bytes."""
-    c = _client()
-    meta = await c.get(f"{ME}/messages/{message_id}/attachments/{attachment_id}",
-                       headers=await _auth(), params={"$select": "name,contentType,size"})
+    meta = await _request_with_retry(
+        "GET", f"{ME}/messages/{_enc(message_id)}/attachments/{_enc(attachment_id)}",
+        headers=await _auth(), params={"$select": "name,contentType,size"})
     meta.raise_for_status()
     m = meta.json()
     filename = m.get("name", "")
@@ -430,8 +479,9 @@ async def get_attachment(message_id: str, attachment_id: str) -> dict:
             f"ATTACHMENT_MAX_MB ({ATTACHMENT_MAX_MB}MB) limit"
         )
 
-    full = await c.get(f"{ME}/messages/{message_id}/attachments/{attachment_id}",
-                       headers=await _auth())
+    full = await _request_with_retry(
+        "GET", f"{ME}/messages/{_enc(message_id)}/attachments/{_enc(attachment_id)}",
+        headers=await _auth())
     full.raise_for_status()
     content_bytes = full.json().get("contentBytes", "")
     raw = base64.b64decode(content_bytes)
@@ -463,19 +513,13 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
         payload: dict = {"comment": body, "message": {"toRecipients": _parse_recipients(to)}}
         if cc:
             payload["message"]["ccRecipients"] = _parse_recipients(cc)
-        r = await _request_with_retry("POST", f"{ME}/messages/{reply_to_message_id}/reply",
+        r = await _request_with_retry("POST", f"{ME}/messages/{_enc(reply_to_message_id)}/reply",
                                       headers=await _auth(), json=payload)
         if r.status_code != 202:
             r.raise_for_status()
         return {"sent": True, "replyTo": reply_to_message_id}
 
-    message: dict = {
-        "subject": subject,
-        "body": {"contentType": "Text", "content": body},
-        "toRecipients": _parse_recipients(to),
-    }
-    if cc:
-        message["ccRecipients"] = _parse_recipients(cc)
+    message = _build_message(subject, body, to, cc)
     r = await _request_with_retry("POST", f"{ME}/sendMail", headers=await _auth(),
                                   json={"message": message, "saveToSentItems": True})
     if r.status_code != 202:
@@ -487,13 +531,7 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
 async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a draft email."""
     _require_write()
-    message: dict = {
-        "subject": subject,
-        "body": {"contentType": "Text", "content": body},
-        "toRecipients": _parse_recipients(to),
-    }
-    if cc:
-        message["ccRecipients"] = _parse_recipients(cc)
+    message = _build_message(subject, body, to, cc)
     r = await _request_with_retry("POST", f"{ME}/messages", headers=await _auth(), json=message)
     r.raise_for_status()
     return r.json()
@@ -502,9 +540,8 @@ async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
 @mcp.tool
 async def list_drafts(max_results: int = 10) -> list[dict]:
     """List draft emails."""
-    c = _client()
-    r = await c.get(f"{ME}/mailFolders/drafts/messages", headers=await _auth(),
-                    params={"$top": max_results})
+    r = await _request_with_retry("GET", f"{ME}/mailFolders/drafts/messages", headers=await _auth(),
+                                  params={"$top": max_results})
     r.raise_for_status()
     return r.json().get("value", [])
 
@@ -513,7 +550,7 @@ async def list_drafts(max_results: int = 10) -> list[dict]:
 async def send_draft(draft_id: str) -> dict:
     """Send an existing draft."""
     _require_write()
-    r = await _request_with_retry("POST", f"{ME}/messages/{draft_id}/send", headers=await _auth())
+    r = await _request_with_retry("POST", f"{ME}/messages/{_enc(draft_id)}/send", headers=await _auth())
     if r.status_code != 202:
         r.raise_for_status()
     return {"sent": draft_id}
@@ -524,14 +561,8 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
                        cc: str = "") -> dict:
     """Replace the content of an existing draft."""
     _require_write()
-    message: dict = {
-        "subject": subject,
-        "body": {"contentType": "Text", "content": body},
-        "toRecipients": _parse_recipients(to),
-    }
-    if cc:
-        message["ccRecipients"] = _parse_recipients(cc)
-    r = await _request_with_retry("PATCH", f"{ME}/messages/{draft_id}", headers=await _auth(),
+    message = _build_message(subject, body, to, cc)
+    r = await _request_with_retry("PATCH", f"{ME}/messages/{_enc(draft_id)}", headers=await _auth(),
                                   json=message)
     r.raise_for_status()
     return r.json()
@@ -541,16 +572,15 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
 async def delete_draft(draft_id: str) -> dict:
     """Permanently delete a draft."""
     _require_write()
-    r = await _request_with_retry("DELETE", f"{ME}/messages/{draft_id}", headers=await _auth())
+    r = await _request_with_retry("DELETE", f"{ME}/messages/{_enc(draft_id)}", headers=await _auth())
     if r.status_code != 204:
         r.raise_for_status()
     return {"deleted": draft_id}
 
 
 async def _list_child_folders(folder_id: str | None) -> list[dict]:
-    c = _client()
-    url = f"{ME}/mailFolders" if folder_id is None else f"{ME}/mailFolders/{folder_id}/childFolders"
-    r = await c.get(url, headers=await _auth(), params={"$top": 100})
+    url = f"{ME}/mailFolders" if folder_id is None else f"{ME}/mailFolders/{_enc(folder_id)}/childFolders"
+    r = await _request_with_retry("GET", url, headers=await _auth(), params={"$top": 100})
     r.raise_for_status()
     return r.json().get("value", [])
 
@@ -587,13 +617,10 @@ async def list_folders(parent_folder_id: str = "", recursive: bool = False,
         depth = 0
         while frontier and depth < 6:  # guards against pathological nesting
             depth += 1
-            next_frontier: list[dict] = []
-            for parent in frontier:
-                if parent.get("childFolderCount", 0) > 0:
-                    children = await _list_child_folders(parent["id"])
-                    folders.extend(children)
-                    next_frontier.extend(children)
-            frontier = next_frontier
+            parents = [p for p in frontier if p.get("childFolderCount", 0) > 0]
+            results = await asyncio.gather(*(_list_child_folders(p["id"]) for p in parents))
+            frontier = [child for children in results for child in children]
+            folders.extend(frontier)
     if name_contains:
         needle = name_contains.casefold()
         folders = [f for f in folders if needle in f.get("displayName", "").casefold()]
@@ -604,7 +631,8 @@ async def list_folders(parent_folder_id: str = "", recursive: bool = False,
 async def create_folder(display_name: str, parent_folder_id: str = "") -> dict:
     """Create a mail folder, optionally nested under parent_folder_id."""
     _require_write()
-    url = f"{ME}/mailFolders/{parent_folder_id}/childFolders" if parent_folder_id else f"{ME}/mailFolders"
+    url = (f"{ME}/mailFolders/{_enc(parent_folder_id)}/childFolders" if parent_folder_id
+           else f"{ME}/mailFolders")
     r = await _request_with_retry("POST", url, headers=await _auth(), json={"displayName": display_name})
     r.raise_for_status()
     return r.json()
@@ -616,7 +644,7 @@ async def update_folder(folder_id: str, display_name: str) -> dict:
     rename-only, unlike Gmail's update_label which could also change label/
     message-list visibility."""
     _require_write()
-    r = await _request_with_retry("PATCH", f"{ME}/mailFolders/{folder_id}", headers=await _auth(),
+    r = await _request_with_retry("PATCH", f"{ME}/mailFolders/{_enc(folder_id)}", headers=await _auth(),
                                   json={"displayName": display_name})
     r.raise_for_status()
     return r.json()
@@ -626,7 +654,7 @@ async def update_folder(folder_id: str, display_name: str) -> dict:
 async def delete_folder(folder_id: str) -> dict:
     """Permanently delete a mail folder and everything in it."""
     _require_write()
-    r = await _request_with_retry("DELETE", f"{ME}/mailFolders/{folder_id}", headers=await _auth())
+    r = await _request_with_retry("DELETE", f"{ME}/mailFolders/{_enc(folder_id)}", headers=await _auth())
     if r.status_code != 204:
         r.raise_for_status()
     return {"deleted": folder_id}
@@ -637,12 +665,11 @@ async def move_folder(folder_id: str, destination_folder_id: str) -> dict:
     """Move a folder — and everything in it, including its own subfolders — to
     become a child of another folder (e.g. re-parenting a folder to live under
     Inbox). Accepts a real folder id or a well-known name ('inbox', 'archive',
-    etc.) for either argument. Unlike move_message, Graph's documentation
-    doesn't state whether the folder keeps its id or is assigned a new one —
-    treat the id in this result as authoritative afterward, not the original
-    folder_id, until you've confirmed which it is for your account."""
+    etc.) for either argument. Unlike move_message, a moved folder keeps its
+    original id (confirmed by live testing) — the id in this result will match
+    folder_id; only parentFolderId changes."""
     _require_write()
-    r = await _request_with_retry("POST", f"{ME}/mailFolders/{folder_id}/move", headers=await _auth(),
+    r = await _request_with_retry("POST", f"{ME}/mailFolders/{_enc(folder_id)}/move", headers=await _auth(),
                                   json={"destinationId": destination_folder_id})
     r.raise_for_status()
     return r.json()
@@ -653,8 +680,7 @@ async def list_categories() -> list[dict]:
     """List the mailbox's master category list (name + color for each tag —
     the closest Outlook equivalent to a Gmail label, though categories have no
     per-tag visibility options)."""
-    c = _client()
-    r = await c.get(f"{ME}/outlook/masterCategories", headers=await _auth())
+    r = await _request_with_retry("GET", f"{ME}/outlook/masterCategories", headers=await _auth())
     r.raise_for_status()
     return r.json().get("value", [])
 
@@ -667,14 +693,13 @@ async def update_categories(message_id: str, add: list[str] | None = None,
     current list, merges in add/remove, and writes the full array back, so two
     concurrent updates to the same message could race."""
     _require_write()
-    c = _client()
-    r = await c.get(f"{ME}/messages/{message_id}", headers=await _auth(),
-                    params={"$select": "categories"})
+    r = await _request_with_retry("GET", f"{ME}/messages/{_enc(message_id)}", headers=await _auth(),
+                                  params={"$select": "categories"})
     r.raise_for_status()
     current = set(r.json().get("categories", []))
     current |= set(add or [])
     current -= set(remove or [])
-    r2 = await _request_with_retry("PATCH", f"{ME}/messages/{message_id}", headers=await _auth(),
+    r2 = await _request_with_retry("PATCH", f"{ME}/messages/{_enc(message_id)}", headers=await _auth(),
                                    json={"categories": sorted(current)})
     r2.raise_for_status()
     return r2.json()
@@ -688,7 +713,7 @@ async def move_message(message_id: str, destination_folder_id: str) -> dict:
     further operations, not the original message_id — Gmail message ids never
     change on a label change, but Outlook message ids do change on a move."""
     _require_write()
-    r = await _request_with_retry("POST", f"{ME}/messages/{message_id}/move", headers=await _auth(),
+    r = await _request_with_retry("POST", f"{ME}/messages/{_enc(message_id)}/move", headers=await _auth(),
                                   json={"destinationId": destination_folder_id})
     r.raise_for_status()
     return r.json()
@@ -700,7 +725,7 @@ async def mark_as_junk(message_id: str) -> dict:
     to Gmail's report_phishing (there's no separate "report to Microsoft" API;
     this just relocates the message, same as Gmail's did)."""
     _require_write()
-    r = await _request_with_retry("POST", f"{ME}/messages/{message_id}/move", headers=await _auth(),
+    r = await _request_with_retry("POST", f"{ME}/messages/{_enc(message_id)}/move", headers=await _auth(),
                                   json={"destinationId": "junkemail"})
     r.raise_for_status()
     return r.json()
@@ -711,7 +736,7 @@ async def trash_message(message_id: str) -> dict:
     """Move a message to Deleted Items (soft delete, matching Gmail's trash
     semantics)."""
     _require_write()
-    r = await _request_with_retry("POST", f"{ME}/messages/{message_id}/move", headers=await _auth(),
+    r = await _request_with_retry("POST", f"{ME}/messages/{_enc(message_id)}/move", headers=await _auth(),
                                   json={"destinationId": "deleteditems"})
     r.raise_for_status()
     return r.json()
@@ -720,8 +745,7 @@ async def trash_message(message_id: str) -> dict:
 @mcp.tool
 async def list_calendars() -> list[dict]:
     """List all calendars on the account."""
-    c = _client()
-    r = await c.get(f"{ME}/calendars", headers=await _auth())
+    r = await _request_with_retry("GET", f"{ME}/calendars", headers=await _auth())
     r.raise_for_status()
     return r.json().get("value", [])
 
@@ -736,8 +760,7 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
     now = datetime.now(UTC)
     start = time_min or now.isoformat()
     end = time_max or (now + timedelta(days=30)).isoformat()
-    c = _client()
-    r = await c.get(f"{_calendar_base(calendar_id)}/calendarView", headers={
+    r = await _request_with_retry("GET", f"{_calendar_base(calendar_id)}/calendarView", headers={
         **await _auth(), "Prefer": 'outlook.timezone="UTC"',
     }, params={"startDateTime": start, "endDateTime": end, "$top": max_results})
     r.raise_for_status()
@@ -750,9 +773,9 @@ async def search_events(query: str, calendar_id: str = "primary",
     """Search events by keyword. Unlike list_events, this does not expand
     recurring events into individual occurrences — it matches the recurring
     series itself, not each future instance."""
-    c = _client()
-    r = await c.get(f"{_calendar_base(calendar_id)}/events", headers=await _auth(),
-                    params={"$search": f'"{query}"', "$top": max_results})
+    r = await _request_with_retry(
+        "GET", f"{_calendar_base(calendar_id)}/events", headers=await _auth(),
+        params={"$search": f'"{_escape_search_phrase(query)}"', "$top": max_results})
     r.raise_for_status()
     return r.json().get("value", [])
 
@@ -760,8 +783,8 @@ async def search_events(query: str, calendar_id: str = "primary",
 @mcp.tool
 async def get_event(event_id: str, calendar_id: str = "primary") -> dict:
     """Get a specific calendar event by ID."""
-    c = _client()
-    r = await c.get(f"{_calendar_base(calendar_id)}/events/{event_id}", headers=await _auth())
+    r = await _request_with_retry("GET", f"{_calendar_base(calendar_id)}/events/{_enc(event_id)}",
+                                  headers=await _auth())
     r.raise_for_status()
     return r.json()
 
@@ -1060,7 +1083,6 @@ class _App:
                     await self._send_401(send, alias)
                     return
                 _session_jti.set(payload["jti"])
-                _user_email.set(payload.get("email", ""))
                 _read_only.set(_effective_read_only(payload, alias))
 
             if path in _OAUTH_PATHS:

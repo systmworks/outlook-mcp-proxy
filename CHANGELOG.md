@@ -9,6 +9,75 @@ tracked in git commit history only, not here.
 
 ## 2026-09-12
 
+### 0.6 — Fix confirmed injection, id-encoding, and token-purge race
+
+The three lower-confidence findings from 0.5's review were tested/reproduced
+directly (live search against the real mailbox, a Microsoft Learn/GitHub
+check on Graph id formats, and a mocked-transport reproduction script) before
+fixing, since each turned out to be confirmable rather than merely plausible.
+
+**Fixed**
+- `search_emails`, `search_events`, and `read_conversation` now escape their
+  input before interpolating into Graph's `$search`/`$filter` parameters.
+  Confirmed live: `search_emails("zzznonexistentqueryterm99887")` returned 0
+  results, but appending `" OR "a` to that same garbage term returned 5
+  unrelated messages — the embedded quote broke out of the intended phrase.
+  `$search` values now have embedded `"` stripped; `$filter` string literals
+  now double an embedded `'` per the OData escaping convention.
+- Every id argument (`message_id`, `folder_id`, `draft_id`, `attachment_id`,
+  `event_id`, `calendar_id`) is now URL-encoded (`urllib.parse.quote`) before
+  being interpolated into a Graph REST path. Graph message ids are documented
+  to sometimes contain `/` — a reserved path delimiter — which would
+  otherwise split the request onto an unintended path.
+- `_purge_expired_tokens` now skips a session whose refresh lock is currently
+  held, instead of popping it regardless. Reproduced the bug directly: a
+  concurrent purge (which runs on every incoming request, including
+  unrelated ones) could previously pop a session's `_token_store` entry while
+  `_refresh` was still awaiting Microsoft's response for it, so the
+  refreshed token got written into a dict no longer in the store — the
+  session was silently lost even though `_refresh` reported success.
+
+### 0.5 — Code quality review fixes
+
+A full-file code quality review of `server.py` (bugs, dead code, inefficient
+loops) surfaced several issues; the ones confirmed with high confidence were
+fixed directly.
+
+**Fixed**
+- `_request_with_retry` no longer retries on network-level errors (timeouts,
+  connection resets) — only on a definite retryable HTTP status (429/5xx).
+  A network error left it ambiguous whether a non-idempotent write (e.g.
+  `send_email`'s `/sendMail` POST) had already landed server-side before the
+  retry fired a second, possibly duplicate, request.
+- `_refresh`'s call to Microsoft's token endpoint now goes through
+  `_request_with_retry` too, instead of a bare `httpx` call — a single
+  transient 5xx from Microsoft during a routine access-token refresh no
+  longer forces the session into a full re-auth.
+- `_request_with_retry` now parses `Retry-After` as either form RFC 7231
+  allows (delay-seconds or an HTTP-date), instead of only the delay-seconds
+  form — an HTTP-date value used to fail `float()` parsing and silently fall
+  back to the much shorter default delay.
+- Every read tool's Graph GET call now goes through `_request_with_retry` as
+  well (previously only write tools did) — a transient 429/503 while listing
+  folders or searching mail used to fail the call outright with no recovery,
+  even though reads are idempotent and the safer half to retry.
+- `list_folders(recursive=True)` now fetches each depth level's sibling
+  folders concurrently via `asyncio.gather` instead of one at a time —
+  matters most on the 385-folder mailbox that motivated this feature (0.2).
+- `send_email`, `create_draft`, and `update_draft` now share one
+  `_build_message()` helper instead of each rebuilding an identical
+  subject/body/toRecipients/cc dict.
+- Removed the `_user_email` ContextVar — it was set on every authenticated
+  request but never read anywhere.
+
+**Flagged, not fixed yet** (lower-confidence findings at the time — correctness
+concerns that needed testing/reproduction before a direct fix was warranted):
+unescaped input interpolated into Graph's `$filter`/`$search` OData
+parameters; folder/message/draft/attachment ids interpolated unescaped into
+REST URL paths; and a narrow-window race where `_purge_expired_tokens` can
+pop a session's token entry while `_refresh` is still awaiting Microsoft's
+response for it. All three were confirmed and fixed in 0.6 below.
+
 ### 0.3 — Add move_folder
 
 Requested after live use surfaced the need to re-parent folders (e.g. moving
@@ -22,6 +91,16 @@ Graph supports this via the same `move` action shape as `move_message`
   same as every other write tool. Unlike `move_message`, Graph's own docs
   don't state whether the folder keeps its id or gets a new one on move;
   flagged in the docstring as unconfirmed pending real-world verification.
+
+### 0.4 — Confirm move_folder id behavior
+
+Live-tested against the real mailbox: created a throwaway top-level folder,
+moved it under Inbox, and compared ids. The returned `id` was identical
+before and after the move — only `parentFolderId` changed.
+
+**Changed**
+- `move_folder` docstring now states as fact that a moved folder keeps its
+  original id, rather than flagging it as unconfirmed.
 
 ### 0.2 — Fix list_folders for large mailboxes
 

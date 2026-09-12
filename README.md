@@ -123,6 +123,7 @@ Where this diverges from the [Gmail sibling project](https://github.com/systmwor
 - Categories need read-modify-write (no atomic add/remove on Graph), vs. Gmail's atomic label add/remove.
 - Calendar listing needs two different endpoints (`calendarView` for time-range/recurrence-expansion vs. `events`/`$search`), vs. Gmail's single consistent surface.
 - `move_message` returns a **new** message id — anything holding the old id afterward will fail. Gmail message ids never change.
+- `move_folder`, by contrast, keeps the folder's **original** id — confirmed by live testing; only `parentFolderId` changes.
 - Folder hierarchy is a real tree (`parentFolderId`), vs. Gmail's flat `/`-named labels.
 - Two account-registration facts must be exactly right, with no forgiving fallback: the `consumers`-tenant-only endpoint, and "Personal Microsoft accounts only" in Azure Portal — get either wrong and work/school accounts could authenticate.
 - The Azure client secret **expires within 24 months** (Google's doesn't) — needs a calendar reminder, not a code fix.
