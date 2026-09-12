@@ -97,9 +97,10 @@ bug in this server can't make it send or delete anything; Graph rejects it regar
 The server also refuses write tool calls itself with a clear error, as a second layer.
 
 **Enforcement is server-side and unconditional** — which alias a request comes in
-through is derived from the URL path on every single request, not something the
-client asserts, so a restricted alias stays restricted even if the OAuth client
-never echoes back the `resource` parameter during authorization.
+through is derived from the URL path on every single request, both at `/authorize`
+(when deciding which Microsoft OAuth scopes to request) and on every `/mcp` call
+afterward, not something the client asserts. A restricted alias stays restricted
+even if its bearer token is ever presented to a different connector's endpoint.
 
 ## Development
 

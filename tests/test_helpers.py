@@ -23,22 +23,6 @@ def test_new_pkce_pair_round_trips():
     assert server._pkce_ok(verifier, challenge) is True
 
 
-def test_alias_from_resource_extracts_alias():
-    assert server._alias_from_resource("https://host/work/mcp") == "work"
-
-
-def test_alias_from_resource_returns_empty_for_unaliased():
-    assert server._alias_from_resource("https://host/mcp") == ""
-
-
-def test_alias_from_resource_returns_empty_for_none():
-    assert server._alias_from_resource(None) == ""
-
-
-def test_alias_from_resource_returns_empty_for_unparseable():
-    assert server._alias_from_resource("https://host/a/b/c") == ""
-
-
 def test_split_alias_strips_known_alias():
     assert server._split_alias("/work/mcp") == ("work", "/mcp")
 

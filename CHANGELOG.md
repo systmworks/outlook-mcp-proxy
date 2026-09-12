@@ -9,6 +9,53 @@ tracked in git commit history only, not here.
 
 ## 2026-09-12
 
+### 0.8 — Third review pass: alias-binding fix + duplication cleanup
+
+A third review pass (correctness + "does every line pull its weight?")
+surfaced one real security gap and confirmed several cleanup opportunities
+flagged repeatedly across earlier rounds. Findings were presented to the
+user for review before fixing, per instruction.
+
+**Fixed**
+- `_authorize` decided `read_only` from the client-echoed OAuth `resource`
+  query parameter instead of the server-verified URL path alias already
+  available via `req.state.alias`. If a client ever failed to echo
+  `resource` correctly, the resulting token got full write scope and a
+  `read_only=False` JWT claim — and since that claim (not which alias the
+  token was minted for) is what travels with it, presenting the same token
+  to the unaliased `/mcp` instead of its own `/work/mcp` bypassed the
+  restriction entirely, contradicting this project's documented read-only
+  guarantee. `/authorize` now reads `req.state.alias` directly; the
+  now-unreachable `_alias_from_resource` helper (and its dead tests) were
+  removed.
+- `_www_auth_header` crashed with an unhandled `UnicodeEncodeError` if the
+  request path contained invalid UTF-8 bytes in the alias segment (a
+  surrogate-escaped character from the ASGI server's path decoding). Now
+  encodes with `errors="replace"` instead of the default strict mode;
+  confirmed h11 still accepts the resulting header bytes.
+- `_http_client` is now reset to `None` after `aclose()` in the lifespan
+  handler, matching `_client()`'s own "not initialized" contract instead of
+  silently handing out a closed client.
+- `/authorize` now explicitly rejects a `code_challenge_method` other than
+  `S256` with a clear 400, instead of deferring to an opaque `invalid_grant`
+  at `/token` — `_pkce_ok` only ever supported S256 to begin with.
+
+**Simplified**
+- Added `_call()`/`_call_list()` — a shared "inject auth, retry, raise on
+  error status" helper and its collection-returning variant — and rewrote
+  every `@mcp.tool` function to use them. Removed the `if status != N:
+  raise_for_status()` pattern from 5 write tools entirely: since
+  `raise_for_status()` only ever raises on 4xx/5xx regardless of which
+  specific success code was expected, and none of those 5 functions called
+  `.json()` on the response afterward, the status comparison was pure
+  no-op complexity — flagged as duplication in all three review rounds
+  without being addressed until now. Net effect: ~20 tool functions
+  shortened, `server.py` is 27 lines shorter despite the new fixes' added
+  comments, with zero behavior change (all 113 tests pass unchanged).
+- `_purge_expired_states` now calls a shared `_purge_ttl(store)` helper
+  twice instead of duplicating the same filter/pop loop for `_state_store`
+  and `_code_store`.
+
 ### 0.7 — Second review pass: four more confirmed fixes + regression tests
 
 A follow-up full-file review (to check whether 0.5/0.6 missed anything) found

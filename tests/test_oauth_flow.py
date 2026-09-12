@@ -91,14 +91,15 @@ async def test_authorize_includes_pkce_challenge_for_microsoft_leg(asgi_client):
     assert server._pkce_ok(stored["ms_code_verifier"], q["code_challenge"][0])
 
 
-async def test_authorize_sets_read_only_when_resource_names_restricted_alias(asgi_client):
+async def test_authorize_sets_read_only_when_path_alias_is_restricted(asgi_client):
+    # read_only is decided from the server-verified URL path alias, not a
+    # client-supplied query param — see the regression test below for why.
     original = server.READ_ONLY_ALIASES
     server.READ_ONLY_ALIASES = frozenset({"work"})
     try:
-        r = await asgi_client.get("/authorize", params={
+        r = await asgi_client.get("/work/authorize", params={
             "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
             "code_challenge": "test-challenge",
-            "resource": "http://test/work/mcp",
         })
         assert 300 <= r.status_code < 400
         our_state = _state_query(r.headers["location"])["state"][0]
@@ -108,6 +109,39 @@ async def test_authorize_sets_read_only_when_resource_names_restricted_alias(asg
         assert "Mail.ReadWrite" not in scope
     finally:
         server.READ_ONLY_ALIASES = original
+
+
+async def test_authorize_ignores_client_supplied_resource_param(asgi_client):
+    # Regression test: _authorize previously derived read_only from the
+    # client-echoed 'resource' query param instead of the server-verified
+    # path alias. A client that omitted or mismatched 'resource' got a
+    # read_only=False token even when authenticating through a restricted
+    # alias — and since the JWT's own read_only claim (not which alias it was
+    # minted for) is what travels with the token, that token's write access
+    # then depended on which endpoint it was later presented to, letting it
+    # bypass the restriction entirely if presented to the unaliased /mcp.
+    original = server.READ_ONLY_ALIASES
+    server.READ_ONLY_ALIASES = frozenset({"work"})
+    try:
+        r = await asgi_client.get("/work/authorize", params={
+            "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+            "code_challenge": "test-challenge",
+            "resource": "http://test/mcp",  # deliberately wrong/unaliased
+        })
+        our_state = _state_query(r.headers["location"])["state"][0]
+        stored = server._state_store.pop(our_state)
+        assert stored["read_only"] is True  # path alias wins, not the client-supplied resource
+    finally:
+        server.READ_ONLY_ALIASES = original
+
+
+async def test_authorize_rejects_unsupported_code_challenge_method(asgi_client):
+    r = await asgi_client.get("/authorize", params={
+        "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+        "code_challenge": "test-challenge",
+        "code_challenge_method": "plain",
+    })
+    assert r.status_code == 400
 
 
 # ── _auth_callback ──────────────────────────────────────────────────────────
