@@ -134,6 +134,12 @@ pip install -r requirements.txt
 systemctl restart outlook-mcp-proxy
 ```
 
+Tail live logs to confirm it's serving correctly after the restart:
+```bash
+journalctl -u outlook-mcp-proxy -f
+```
+`Ctrl-C` to stop following; it doesn't stop the service.
+
 Every restart wipes the in-memory session store — after restarting, any connected
 account needs to be removed and re-added in Claude, then signed in again.
 
