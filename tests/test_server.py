@@ -145,6 +145,7 @@ _WRITE_TOOL_CALLS = [
     ("create_folder", ("New Folder",)),
     ("update_folder", ("f1", "Renamed")),
     ("delete_folder", ("f1",)),
+    ("move_folder", ("f1", "inbox")),
     ("update_categories", ("m1",)),
     ("move_message", ("m1", "archive")),
     ("mark_as_junk", ("m1",)),
@@ -244,6 +245,18 @@ async def test_move_message_returns_new_message_id():
     result = await server.move_message("m1", "archive")
     assert result["id"] == "m1-new-id-after-move"
     assert result["id"] != "m1"
+
+
+@respx.mock
+async def test_move_folder_reparents_under_destination():
+    route = respx.post(f"{server.ME}/mailFolders/f1/move").mock(return_value=httpx.Response(200, json={
+        "id": "f1", "displayName": "Lot 33", "parentFolderId": "inbox-id",
+    }))
+    result = await server.move_folder("f1", "inbox")
+    import json
+    body = json.loads(route.calls.last.request.content)
+    assert body["destinationId"] == "inbox"
+    assert result["parentFolderId"] == "inbox-id"
 
 
 @respx.mock

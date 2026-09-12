@@ -52,6 +52,7 @@ different Microsoft account.
 | `create_folder` | Create a folder, optionally nested |
 | `update_folder` | Rename a folder |
 | `delete_folder` | Permanently delete a folder |
+| `move_folder` | Re-parent a folder (and its contents/subfolders) under another folder |
 | `list_categories` | The mailbox's master category list (color-coded tags) |
 | `update_categories` | Add/remove categories on a message |
 | `move_message` | Move a message to another folder |

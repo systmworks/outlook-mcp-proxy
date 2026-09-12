@@ -633,6 +633,22 @@ async def delete_folder(folder_id: str) -> dict:
 
 
 @mcp.tool
+async def move_folder(folder_id: str, destination_folder_id: str) -> dict:
+    """Move a folder — and everything in it, including its own subfolders — to
+    become a child of another folder (e.g. re-parenting a folder to live under
+    Inbox). Accepts a real folder id or a well-known name ('inbox', 'archive',
+    etc.) for either argument. Unlike move_message, Graph's documentation
+    doesn't state whether the folder keeps its id or is assigned a new one —
+    treat the id in this result as authoritative afterward, not the original
+    folder_id, until you've confirmed which it is for your account."""
+    _require_write()
+    r = await _request_with_retry("POST", f"{ME}/mailFolders/{folder_id}/move", headers=await _auth(),
+                                  json={"destinationId": destination_folder_id})
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool
 async def list_categories() -> list[dict]:
     """List the mailbox's master category list (name + color for each tag —
     the closest Outlook equivalent to a Gmail label, though categories have no

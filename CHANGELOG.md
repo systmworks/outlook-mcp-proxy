@@ -9,6 +9,20 @@ tracked in git commit history only, not here.
 
 ## 2026-09-12
 
+### 0.3 — Add move_folder
+
+Requested after live use surfaced the need to re-parent folders (e.g. moving
+a "Lot NN" folder that had ended up at the mailbox root back under Inbox).
+Graph supports this via the same `move` action shape as `move_message`
+(`POST /me/mailFolders/{id}/move`, `{"destinationId": ...}`), using the same
+`Mail.ReadWrite` scope already requested — no new OAuth consent needed.
+
+**Added**
+- `move_folder(folder_id, destination_folder_id)` — behind `_require_write()`,
+  same as every other write tool. Unlike `move_message`, Graph's own docs
+  don't state whether the folder keeps its id or gets a new one on move;
+  flagged in the docstring as unconfirmed pending real-world verification.
+
 ### 0.2 — Fix list_folders for large mailboxes
 
 Live testing against a real mailbox organized into hundreds of per-property
