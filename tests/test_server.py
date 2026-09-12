@@ -101,6 +101,43 @@ async def test_read_conversation_orders_by_received_date_time():
 
 
 @respx.mock
+async def test_read_conversation_escapes_embedded_quote_in_conversation_id():
+    # Regression test: an unescaped "'" previously let a crafted conversation_id
+    # break out of the $filter string literal and alter the query Graph received.
+    route = respx.get(f"{server.ME}/messages").mock(return_value=httpx.Response(200, json={"value": []}))
+    await server.read_conversation("x' or true or conversationId eq 'y")
+    sent = route.calls.last.request.url.params["$filter"]
+    assert sent == "conversationId eq 'x'' or true or conversationId eq ''y'"
+
+
+@respx.mock
+async def test_search_emails_escapes_embedded_quote_in_query():
+    # Regression test: live-confirmed that an unescaped '"' let a crafted query
+    # break out of the intended $search phrase (garbage term + '" OR "a'
+    # returned unrelated messages instead of zero results).
+    route = respx.get(f"{server.ME}/messages").mock(return_value=httpx.Response(200, json={"value": []}))
+    await server.search_emails('zzz" OR "a')
+    sent = route.calls.last.request.url.params["$search"]
+    assert sent == '"zzz OR a"'
+
+
+@respx.mock
+async def test_read_message_url_encodes_message_id_containing_slash():
+    # Regression test: Graph message ids are documented to sometimes contain
+    # '/' — a reserved path delimiter — which must be percent-encoded or it
+    # splits the request onto an unintended path.
+    route = respx.get(url__regex=r".*/messages/.*").mock(return_value=httpx.Response(200, json={
+        "id": "m1/weird", "conversationId": "", "from": None, "toRecipients": [],
+        "ccRecipients": [], "subject": "", "receivedDateTime": "", "bodyPreview": "",
+        "body": {"contentType": "text", "content": ""}, "categories": [],
+        "parentFolderId": "", "hasAttachments": False,
+    }))
+    await server.read_message("m1/weird")
+    assert route.calls.last.request.url.raw_path == \
+        b"/v1.0/me/messages/m1%2Fweird"
+
+
+@respx.mock
 async def test_get_attachment_checks_declared_size_before_downloading():
     server.ATTACHMENT_MAX_MB, orig = 1, server.ATTACHMENT_MAX_MB
     server.ATTACHMENT_MAX_BYTES, orig_bytes = 1 * 1024 * 1024, server.ATTACHMENT_MAX_BYTES

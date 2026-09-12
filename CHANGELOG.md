@@ -9,6 +9,49 @@ tracked in git commit history only, not here.
 
 ## 2026-09-12
 
+### 0.7 — Second review pass: four more confirmed fixes + regression tests
+
+A follow-up full-file review (to check whether 0.5/0.6 missed anything) found
+four more issues, each confirmed by direct execution before fixing. Also
+closed the test-coverage gap 0.5/0.6 left behind — none of their new helpers
+or behavior changes had a regression test until now.
+
+**Fixed**
+- `READ_ONLY_ALIASES` env parsing filtered tokens *before* stripping slashes,
+  not after — a slash-only token (e.g. a stray `/`) passed the filter but
+  collapsed to `""` once stripped, silently inserting the empty string into
+  the set. Since `""` is also the alias of the *unaliased* connector, a
+  malformed `READ_ONLY_ALIASES` value could force the main connector into
+  read-only mode. Confirmed directly: `READ_ONLY_ALIASES=work,/` produced
+  `frozenset({'', 'work'})` before the fix. Extracted into a standalone
+  `_parse_read_only_aliases()` helper that filters on the final value.
+- `_auth_callback`'s Microsoft token-exchange and profile-fetch calls now go
+  through `_request_with_retry` like every other outbound call in this file
+  (they were still using a raw `httpx` call) — a transient 5xx during the
+  one-time authorization-code exchange no longer fails the whole login.
+- `_parse_retry_after` now rejects non-finite values — `float("inf")` parses
+  without error, which would otherwise hang a retry's `asyncio.sleep`
+  indefinitely. `_request_with_retry` also caps any Retry-After-derived delay
+  at `_MAX_RETRY_DELAY` (60s) as a second layer, since an absurdly large but
+  finite value (`"99999999999"`) isn't caught by the finiteness check alone.
+- A non-canonical request path like `//mcp` previously matched neither a
+  known OAuth path nor the `/mcp`/`/mcp/` auth-gate check, skipping
+  bearer-auth validation entirely and falling through to the mounted FastMCP
+  app relying solely on downstream routing behavior to not also treat it as
+  equivalent. Added `_normalize_path()` (collapses repeated slashes) and
+  apply it before alias-splitting and auth-gate matching. Confirmed directly
+  that `//mcp` bypassed the auth gate before the fix and is routed through it
+  correctly after.
+
+**Added**
+- 23 new regression tests covering every fix in 0.5/0.6/0.7 that had none:
+  `_enc`, `_escape_search_phrase`, `_escape_odata_literal`, `_build_message`,
+  `_normalize_path`, `_parse_read_only_aliases`, `_parse_retry_after`'s
+  non-finite rejection, `_request_with_retry` no longer retrying network
+  errors, the Retry-After cap, the `_purge_expired_tokens` lock-skip
+  behavior, `_auth_callback`'s new retry, and the `$search`/`$filter`
+  escaping and id URL-encoding at the tool level.
+
 ### 0.6 — Fix confirmed injection, id-encoding, and token-purge race
 
 The three lower-confidence findings from 0.5's review were tested/reproduced

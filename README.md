@@ -84,7 +84,7 @@ easy additions on Graph, deliberately deferred; see [Outlook vs Gmail](#outlook-
 | `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
 | `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `family`) that should be restricted to read-only access — no send, draft, folder/category changes, or move/trash. See below. |
-| `API_RETRY_ATTEMPTS` | Optional. Total attempts (1–5) for a write-tool call before giving up. Defaults to `2`. Honors a `Retry-After` response header from Graph when present. |
+| `API_RETRY_ATTEMPTS` | Optional. Total attempts (1–5) for an outbound Graph API call (read or write) before giving up on a retryable status (429/5xx). Defaults to `2`. Honors a `Retry-After` response header from Graph when present, in either delay-seconds or HTTP-date form. |
 | `ATTACHMENT_MAX_MB` | Optional. Max attachment size (1–25MB, decoded) `get_attachment` will fetch. Defaults to `3`. Attachment bytes return as base64 text inside the MCP tool result — straight into the calling LLM's context, not just over the network. |
 
 ## Read-only accounts

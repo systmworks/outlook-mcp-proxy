@@ -13,7 +13,9 @@ import base64
 import hashlib
 import hmac
 import logging
+import math
 import os
+import re
 import secrets
 import time
 from contextvars import ContextVar
@@ -66,12 +68,20 @@ ALLOWED_REDIRECT_URIS = frozenset(
     ).split(",") if u.strip()
 )
 
+def _parse_read_only_aliases(value: str) -> frozenset[str]:
+    """Comma-separated alias list -> a set of normalised (whitespace- and
+    slash-stripped) aliases, dropping any token that's empty after stripping
+    (e.g. a stray '/' entry) instead of letting it collapse to '' and silently
+    matching the unaliased connector (whose alias is also '')."""
+    return frozenset(
+        stripped for a in value.split(",")
+        if (stripped := a.strip().strip("/"))
+    )
+
+
 # Aliased connectors (e.g. /work/mcp) named here get Microsoft Graph scopes covering
 # only read access — see _ms_scopes() and _alias_from_resource() below.
-READ_ONLY_ALIASES = frozenset(
-    a.strip().strip("/") for a in os.environ.get("READ_ONLY_ALIASES", "").split(",")
-    if a.strip()
-)
+READ_ONLY_ALIASES = _parse_read_only_aliases(os.environ.get("READ_ONLY_ALIASES", ""))
 
 # consumers-tenant-only — the single most important line in this file. Using /common
 # or /organizations here would let work/school (Azure AD) accounts authenticate too;
@@ -110,6 +120,7 @@ _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 # single call, with no chance to recover.
 API_RETRY_ATTEMPTS = max(1, min(5, int(os.environ.get("API_RETRY_ATTEMPTS", "2"))))
 _API_RETRY_DELAY = 0.3  # seconds between attempts, unless Retry-After says otherwise
+_MAX_RETRY_DELAY = 60.0  # cap a Retry-After value — a bogus "inf"/huge value must not hang a call
 
 # Shared connection-pooled client for all outbound Graph/Microsoft OAuth requests.
 # Created/closed around the ASGI lifespan in _App.__call__ — avoids paying a fresh
@@ -256,18 +267,22 @@ async def _auth() -> dict:
 
 def _parse_retry_after(value: str) -> float | None:
     """Parse a Retry-After header value in either form RFC 7231 allows: a
-    delay-seconds integer, or an HTTP-date. Returns None if neither parses."""
+    delay-seconds integer, or an HTTP-date. Returns None if neither parses, or
+    if the value isn't a finite number (float() itself happily parses "inf"/
+    "nan", which would otherwise hang a retry's sleep indefinitely)."""
     try:
-        return float(value)
+        seconds = float(value)
     except ValueError:
-        pass
-    try:
-        when = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return (when - datetime.now(UTC)).total_seconds()
+        seconds = None
+    if seconds is None:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        seconds = (when - datetime.now(UTC)).total_seconds()
+    return seconds if math.isfinite(seconds) else None
 
 
 async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Response:
@@ -293,7 +308,7 @@ async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Res
                 parsed = _parse_retry_after(retry_after)
                 if parsed is not None:
                     delay = max(delay, parsed)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(min(delay, _MAX_RETRY_DELAY))
     assert r is not None
     return r
 
@@ -874,8 +889,7 @@ async def _auth_callback(req: Request):
     if not state_data:
         return Response("Invalid or expired state", status_code=400)
 
-    c = _client()
-    r = await c.post(MS_TOKEN_URL, data={
+    r = await _request_with_retry("POST", MS_TOKEN_URL, data={
         "code": req.query_params.get("code"),
         "client_id": MS_CLIENT_ID,
         "client_secret": MS_CLIENT_SECRET,
@@ -890,8 +904,9 @@ async def _auth_callback(req: Request):
         log.warning("Microsoft token exchange failed: %s", tokens.get("error"))
         return Response(f"Token exchange failed: {tokens['error']}", status_code=400)
 
-    ui = await c.get(ME, headers={"Authorization": f"Bearer {tokens['access_token']}"},
-                     params={"$select": "id,displayName,mail,userPrincipalName"})
+    ui = await _request_with_retry(
+        "GET", ME, headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        params={"$select": "id,displayName,mail,userPrincipalName"})
     if not ui.is_success:
         log.warning("Microsoft /me fetch failed (%s): %s", ui.status_code, ui.text[:200])
         return Response("Failed to fetch Microsoft account info", status_code=502)
@@ -1006,6 +1021,19 @@ def _with_security_headers(send):
     return wrapped
 
 
+_MULTI_SLASH = re.compile(r"/+")
+
+
+def _normalize_path(path: str) -> str:
+    """Collapse repeated slashes (e.g. '//mcp' -> '/mcp') before any routing or
+    auth-gate matching runs. Without this, a non-canonical path form matches
+    neither a known OAuth path nor the '/mcp'/'/mcp/' auth-gate check below —
+    falling through to the mounted FastMCP app with no bearer-auth check
+    performed at all, relying entirely on downstream routing behavior (which
+    this file has no control over) to not also treat it as equivalent."""
+    return _MULTI_SLASH.sub("/", path)
+
+
 def _split_alias(path: str) -> tuple[str, str]:
     """Strip a leading /<alias> segment so /personal/mcp, /work/.well-known/... etc.
     resolve the same as their unaliased routes — lets two Claude connectors share one
@@ -1053,7 +1081,7 @@ class _App:
             except Exception:
                 log.exception("periodic cleanup failed")
 
-            alias, path = _split_alias(scope["path"])
+            alias, path = _split_alias(_normalize_path(scope["path"]))
             if path != scope["path"]:
                 scope = {**scope, "path": path, "raw_path": path.encode()}
             # Starlette route handlers (e.g. _protected_resource) read this via

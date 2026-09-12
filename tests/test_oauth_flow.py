@@ -172,6 +172,28 @@ async def test_auth_callback_returns_502_when_no_email_resolvable(asgi_client, s
 
 
 @respx.mock
+async def test_auth_callback_retries_transient_token_exchange_failure(asgi_client, state):
+    # Regression test: _auth_callback previously used a raw httpx call with no
+    # retry, inconsistent with every other outbound Graph/MS call in this file —
+    # a single transient 5xx during the one-time code exchange failed the whole
+    # login instead of recovering.
+    respx.post(server.MS_TOKEN_URL).mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={"access_token": "mstok", "refresh_token": "rtok",
+                                  "expires_in": 3600}),
+    ])
+    respx.get(server.ME).mock(
+        return_value=httpx.Response(200, json={"mail": "a@example.com",
+                                               "userPrincipalName": "a@example.com"})
+    )
+    r = await asgi_client.get("/auth/callback", params={"state": state, "code": "ms-code"})
+    assert 300 <= r.status_code < 400
+    parsed = _state_query(r.headers["location"])
+    code_data = server._code_store.pop(parsed["code"][0])
+    server._token_store.pop(code_data["jti"], None)
+
+
+@respx.mock
 async def test_auth_callback_happy_path_creates_session_and_redirects(asgi_client, state):
     respx.post(server.MS_TOKEN_URL).mock(
         return_value=httpx.Response(200, json={
@@ -327,6 +349,46 @@ async def test_refresh_concurrent_calls_for_same_session_issue_one_http_request(
     finally:
         server._token_store.pop(jti, None)
         server._refresh_locks.pop(jti, None)
+
+
+# ── _purge_expired_tokens ───────────────────────────────────────────────────
+
+async def test_purge_expired_tokens_skips_session_with_in_flight_refresh():
+    # Regression test: _purge_expired_tokens previously popped an expired
+    # session's _token_store/_refresh_locks entry unconditionally, even while
+    # _refresh was still awaiting Microsoft's response for that same session —
+    # the refreshed token would then be written into a dict no longer in the
+    # store, silently losing the session despite _refresh reporting success.
+    jti = "jti-purge-race"
+    server._token_store[jti] = {
+        "access_token": "old", "refresh_token": "rtok",
+        "expiry": time.time() + 3600, "email": "a@example.com", "read_only": False,
+        "jwt_exp": time.time() - 1,  # already past the purge threshold
+    }
+    lock = asyncio.Lock()
+    server._refresh_locks[jti] = lock
+    await lock.acquire()  # simulate _refresh currently holding the lock
+    try:
+        server._purge_expired_tokens()
+        assert jti in server._token_store
+        assert jti in server._refresh_locks
+    finally:
+        lock.release()
+        server._token_store.pop(jti, None)
+        server._refresh_locks.pop(jti, None)
+
+
+async def test_purge_expired_tokens_removes_session_once_lock_is_free():
+    jti = "jti-purge-free"
+    server._token_store[jti] = {
+        "access_token": "old", "refresh_token": "rtok",
+        "expiry": time.time() + 3600, "email": "a@example.com", "read_only": False,
+        "jwt_exp": time.time() - 1,
+    }
+    server._refresh_locks[jti] = asyncio.Lock()  # present but not held
+    server._purge_expired_tokens()
+    assert jti not in server._token_store
+    assert jti not in server._refresh_locks
 
 
 # ── Bearer-auth middleware (/mcp) ───────────────────────────────────────────

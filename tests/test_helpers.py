@@ -154,6 +154,144 @@ def test_effective_read_only_false_for_unrestricted_alias():
         server.READ_ONLY_ALIASES = original
 
 
+def test_enc_passes_through_safe_characters():
+    assert server._enc("abc123-_.~") == "abc123-_.~"
+
+
+def test_enc_percent_encodes_reserved_path_characters():
+    # Graph message ids are documented to sometimes contain '/' — a reserved
+    # path delimiter — which must be encoded or it splits the request path.
+    assert server._enc("m1/weird") == "m1%2Fweird"
+    assert server._enc("a?b") == "a%3Fb"
+
+
+def test_escape_search_phrase_strips_embedded_quotes():
+    # Regression test: an embedded '"' previously broke out of the $search
+    # phrase Graph receives (confirmed live: a garbage term + '" OR "a'
+    # returned unrelated messages instead of zero results).
+    assert server._escape_search_phrase('foo" OR "bar') == "foo OR bar"
+
+
+def test_escape_search_phrase_leaves_plain_query_untouched():
+    assert server._escape_search_phrase("from:a@example.com") == "from:a@example.com"
+
+
+def test_escape_odata_literal_doubles_embedded_quotes():
+    # Regression test: an embedded "'" previously broke out of the $filter
+    # string literal Graph receives.
+    assert server._escape_odata_literal("x' or true or conversationId eq 'y") == \
+        "x'' or true or conversationId eq ''y"
+
+
+def test_escape_odata_literal_leaves_plain_id_untouched():
+    assert server._escape_odata_literal("AQMkADAwATNi") == "AQMkADAwATNi"
+
+
+def test_build_message_includes_cc_only_when_given():
+    msg = server._build_message("Subj", "Body", "a@example.com")
+    assert "ccRecipients" not in msg
+    msg_with_cc = server._build_message("Subj", "Body", "a@example.com", "b@example.com")
+    assert msg_with_cc["ccRecipients"] == [{"emailAddress": {"address": "b@example.com"}}]
+
+
+def test_build_message_shape():
+    msg = server._build_message("Subj", "Body", "a@example.com")
+    assert msg == {
+        "subject": "Subj",
+        "body": {"contentType": "Text", "content": "Body"},
+        "toRecipients": [{"emailAddress": {"address": "a@example.com"}}],
+    }
+
+
+def test_normalize_path_collapses_repeated_slashes():
+    # Regression test: a non-canonical path like '//mcp' previously matched
+    # neither a known OAuth path nor the '/mcp' auth-gate check, skipping
+    # bearer-auth validation entirely.
+    assert server._normalize_path("//mcp") == "/mcp"
+    assert server._normalize_path("///mcp") == "/mcp"
+    assert server._normalize_path("//work//mcp") == "/work/mcp"
+
+
+def test_normalize_path_leaves_canonical_path_untouched():
+    assert server._normalize_path("/work/mcp") == "/work/mcp"
+
+
+def test_parse_read_only_aliases_ignores_slash_only_token():
+    # Regression test: the old filter-before-strip implementation let a
+    # slash-only token (e.g. a stray "/") collapse to "" and get inserted into
+    # the set — "" also being the alias of the unaliased connector, which would
+    # then be silently forced into read-only mode.
+    aliases = server._parse_read_only_aliases("work,/")
+    assert aliases == frozenset({"work"})
+    assert "" not in aliases
+
+
+def test_parse_read_only_aliases_normalizes_whitespace_and_slashes():
+    assert server._parse_read_only_aliases(" /family/ , work ") == frozenset({"family", "work"})
+
+
+def test_parse_read_only_aliases_empty_string_yields_empty_set():
+    assert server._parse_read_only_aliases("") == frozenset()
+
+
+def test_parse_retry_after_rejects_infinite_value():
+    # Regression test: float("inf") parses without error, which would
+    # otherwise hang a retry's asyncio.sleep indefinitely.
+    assert server._parse_retry_after("inf") is None
+    assert server._parse_retry_after("Infinity") is None
+    assert server._parse_retry_after("-inf") is None
+    assert server._parse_retry_after("nan") is None
+
+
+def test_parse_retry_after_accepts_delay_seconds():
+    assert server._parse_retry_after("7") == 7.0
+
+
+@pytest.mark.asyncio
+async def test_request_with_retry_does_not_retry_network_errors(monkeypatch):
+    # Regression test: a network-level error (timeout, connection reset) leaves
+    # it ambiguous whether the request already landed server-side — blindly
+    # retrying a non-idempotent write could duplicate it, so these must not be
+    # retried, unlike a definite retryable HTTP status.
+    async def raising_request(*args, **kwargs):
+        raise httpx.ConnectError("boom")
+
+    server._http_client = httpx.AsyncClient(timeout=1.0)
+    monkeypatch.setattr(server._http_client, "request", raising_request)
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await server._request_with_retry("GET", "https://graph.microsoft.com/v1.0/me")
+    finally:
+        await server._http_client.aclose()
+        server._http_client = None
+
+
+@pytest.mark.asyncio
+async def test_request_with_retry_caps_absurdly_large_retry_after(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(server.asyncio, "sleep", fake_sleep)
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "99999999999"}, json={})
+        return httpx.Response(200, json={"ok": True})
+
+    server._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=1.0)
+    try:
+        r = await server._request_with_retry("GET", "https://graph.microsoft.com/v1.0/me")
+        assert r.status_code == 200
+        assert sleeps == [server._MAX_RETRY_DELAY]
+    finally:
+        await server._http_client.aclose()
+        server._http_client = None
+
+
 @pytest.mark.asyncio
 async def test_request_with_retry_honors_retry_after_header(monkeypatch):
     sleeps: list[float] = []
