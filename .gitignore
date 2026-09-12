@@ -1,0 +1,9 @@
+.env
+credentials/
+.claude/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv*/
+DEPLOYMENT.md
