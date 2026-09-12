@@ -9,6 +9,22 @@ tracked in git commit history only, not here.
 
 ## 2026-09-13
 
+### 0.12 — Add list_messages (folder-scoped message listing)
+
+Prompted by a mailbox tidy-up: `search_emails` only searches the whole mailbox
+via Graph's `$search` and cannot be scoped to one folder, so there was no way
+to answer "what's actually inside this specific folder" — needed to correctly
+classify rogue folders by their real content (topic) rather than guessing
+from the folder's name.
+
+**Added**
+- `list_messages(folder_id, max_results=20)` — lists messages in one folder
+  (id or well-known name like `"inbox"`), newest first, same field shape as
+  `search_emails`/`read_conversation`. Extracted the `id,conversationId,
+  subject,from,toRecipients,receivedDateTime,bodyPreview,hasAttachments,
+  categories,parentFolderId` `$select` string (previously duplicated in both
+  of those) into a shared `_MESSAGE_SELECT` constant, now used by all three.
+
 ### 0.11 — Trim list_folders payload, add count_folders
 
 Prompted by the token cost of `list_folders(recursive=True)` over a mailbox

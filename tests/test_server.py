@@ -108,6 +108,18 @@ async def test_search_emails_wraps_query_in_quotes_and_returns_hits():
 
 
 @respx.mock
+async def test_list_messages_scopes_to_folder_and_orders_newest_first():
+    route = respx.get(url__regex=r".*/mailFolders/f1%2Fweird/messages").mock(
+        return_value=httpx.Response(200, json={"value": [{"id": "m1", "subject": "hi"}]})
+    )
+    results = await server.list_messages("f1/weird", max_results=5)
+    assert results == [{"id": "m1", "subject": "hi"}]
+    sent = route.calls.last.request.url.params
+    assert sent["$orderby"] == "receivedDateTime desc"
+    assert sent["$top"] == "5"
+
+
+@respx.mock
 async def test_read_message_decodes_body_and_recipients_without_mime_walking():
     respx.get(f"{server.ME}/messages/m1").mock(return_value=httpx.Response(200, json={
         "id": "m1", "conversationId": "c1",

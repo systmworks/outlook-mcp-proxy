@@ -431,18 +431,39 @@ async def get_profile() -> dict:
     return r.json()
 
 
+_MESSAGE_SELECT = ("id,conversationId,subject,from,toRecipients,receivedDateTime,"
+                   "bodyPreview,hasAttachments,categories,parentFolderId")
+
+
 @mcp.tool
 async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     """Search mail using Microsoft Graph's $search syntax (from:, subject:, body:,
     participants:, received:, etc. — similar power to Gmail's operators, but not
     the same syntax). Each hit already includes from/subject/receivedDateTime/
     preview/categories/hasAttachments in this one call — no separate enrichment
-    round-trip needed, unlike the Gmail equivalent."""
+    round-trip needed, unlike the Gmail equivalent. This searches the whole
+    mailbox regardless of folder — use list_messages instead to see what's in
+    one specific folder."""
     return await _call_list("GET", f"{ME}/messages", params={
         "$search": f'"{_escape_search_phrase(query)}"',
         "$top": max_results,
-        "$select": "id,conversationId,subject,from,toRecipients,receivedDateTime,"
-                   "bodyPreview,hasAttachments,categories,parentFolderId",
+        "$select": _MESSAGE_SELECT,
+    })
+
+
+@mcp.tool
+async def list_messages(folder_id: str, max_results: int = 20) -> list[dict]:
+    """List messages actually inside one specific folder, newest first — a
+    folder id from list_folders, or a well-known name like "inbox"/"drafts"/
+    "sentitems". Unlike search_emails (which searches the whole mailbox via
+    Graph's $search and cannot be scoped to a folder), this is the tool for
+    "what's really in this folder" — e.g. auditing a folder whose name alone
+    doesn't tell you what it actually contains before deciding where it
+    belongs."""
+    return await _call_list("GET", f"{ME}/mailFolders/{_enc(folder_id)}/messages", params={
+        "$top": max_results,
+        "$orderby": "receivedDateTime desc",
+        "$select": _MESSAGE_SELECT,
     })
 
 
@@ -496,8 +517,7 @@ async def read_conversation(conversation_id: str) -> list[dict]:
     return await _call_list("GET", f"{ME}/messages", params={
         "$filter": f"conversationId eq '{_escape_odata_literal(conversation_id)}'",
         "$orderby": "receivedDateTime asc",
-        "$select": "id,conversationId,subject,from,toRecipients,receivedDateTime,"
-                   "bodyPreview,hasAttachments,categories,parentFolderId",
+        "$select": _MESSAGE_SELECT,
     })
 
 
