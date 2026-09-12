@@ -29,6 +29,65 @@ async def http_client():
 # ── read tools ─────────────────────────────────────────────────────────────
 
 @respx.mock
+async def test_call_list_all_follows_nextlink_until_exhausted():
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json={
+                "value": [{"id": "a"}], "@odata.nextLink": f"{server.ME}/next",
+            })
+        return httpx.Response(200, json={"value": [{"id": "b"}]})
+
+    respx.get(f"{server.ME}/start").mock(side_effect=handler)
+    respx.get(f"{server.ME}/next").mock(side_effect=handler)
+    items = await server._call_list_all("GET", f"{server.ME}/start", params={"$top": 100})
+    assert [i["id"] for i in items] == ["a", "b"]
+    assert calls["n"] == 2
+
+
+@respx.mock
+async def test_call_list_all_stops_at_page_cap_on_never_ending_nextlink(monkeypatch):
+    # Regression test: a self-referential or never-terminating @odata.nextLink
+    # (e.g. from a misbehaving proxy/cache) must not hang a tool call forever.
+    monkeypatch.setattr(server, "_MAX_PAGINATION_PAGES", 3)
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={
+            "value": [{"id": str(calls["n"])}], "@odata.nextLink": f"{server.ME}/loop",
+        })
+
+    respx.get(f"{server.ME}/loop").mock(side_effect=handler)
+    items = await server._call_list_all("GET", f"{server.ME}/loop")
+    assert calls["n"] == 3
+    assert len(items) == 3
+
+
+@respx.mock
+async def test_call_list_all_resends_headers_on_every_page():
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        assert request.headers["prefer"] == 'outlook.timezone="UTC"'
+        if calls["n"] == 1:
+            return httpx.Response(200, json={
+                "value": [{"id": "a"}], "@odata.nextLink": f"{server.ME}/next2",
+            })
+        return httpx.Response(200, json={"value": [{"id": "b"}]})
+
+    respx.get(f"{server.ME}/start2").mock(side_effect=handler)
+    respx.get(f"{server.ME}/next2").mock(side_effect=handler)
+    items = await server._call_list_all("GET", f"{server.ME}/start2",
+                                        headers={"Prefer": 'outlook.timezone="UTC"'})
+    assert [i["id"] for i in items] == ["a", "b"]
+    assert calls["n"] == 2
+
+
+@respx.mock
 async def test_get_profile_returns_graph_response():
     respx.get(server.ME).mock(return_value=httpx.Response(200, json={
         "id": "u1", "displayName": "Test User", "mail": "a@example.com",
@@ -171,6 +230,19 @@ async def test_get_attachment_reuses_id_across_calls_no_gmail_style_mismatch():
     assert base64.b64decode(result["data"]) == b"hello world"
 
 
+@respx.mock
+async def test_get_attachment_rejects_missing_content_bytes():
+    # Regression test: a referenceAttachment (e.g. a OneDrive link) or certain
+    # itemAttachment types carry no contentBytes — treating that as a valid
+    # empty download would silently hand back a 0-byte "success" instead of a
+    # clear error that this attachment type isn't downloadable this way.
+    respx.get(f"{server.ME}/messages/m1/attachments/a1").mock(return_value=httpx.Response(
+        200, json={"name": "link.url", "contentType": "text/plain", "size": 0},
+    ))
+    with pytest.raises(ValueError, match="no downloadable content"):
+        await server.get_attachment("m1", "a1")
+
+
 # ── write tools: read-only enforcement ───────────────────────────────────────
 
 _WRITE_TOOL_CALLS = [
@@ -209,6 +281,25 @@ async def test_list_folders_defaults_to_top_level_only():
     # into it by default, respx would raise for the unmocked request.
     folders = await server.list_folders()
     assert [f["id"] for f in folders] == ["top"]
+
+
+@respx.mock
+async def test_list_folders_follows_pagination_beyond_one_page():
+    # Regression test: _list_child_folders previously returned only the first
+    # page of Graph's response (observed in production: exactly 100 items)
+    # with no indication to the caller that more folders existed.
+    # nextLink targets a distinct path (not /mailFolders again) so respx's
+    # query-string-agnostic route matching can't accidentally loop forever by
+    # matching the first page's route again.
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "a", "displayName": "A", "childFolderCount": 0}],
+        "@odata.nextLink": f"{server.ME}/mailFolders_page2",
+    }))
+    respx.get(f"{server.ME}/mailFolders_page2").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "b", "displayName": "B", "childFolderCount": 0}],
+    }))
+    folders = await server.list_folders()
+    assert {f["id"] for f in folders} == {"a", "b"}
 
 
 @respx.mock

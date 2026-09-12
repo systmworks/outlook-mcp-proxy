@@ -2,7 +2,8 @@
 
 Self-hosted [MCP](https://modelcontextprotocol.io) server that exposes a **personal**
 Outlook.com account (mail + calendar, via Microsoft Graph) to Claude.ai (or any MCP
-client) via a standard OAuth 2.0 flow — no stored tokens, no pre-generated credentials.
+client) via a standard OAuth 2.0 flow — no pre-generated credentials, and no tokens
+persisted to disk (they live only in memory — see [How it works](#how-it-works)).
 
 **Personal accounts only.** This deliberately uses Microsoft's `consumers`-tenant
 endpoint, which structurally excludes work/school (Azure AD) accounts — only
@@ -86,6 +87,7 @@ easy additions on Graph, deliberately deferred; see [Outlook vs Gmail](#outlook-
 | `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `family`) that should be restricted to read-only access — no send, draft, folder/category changes, or move/trash. See below. |
 | `API_RETRY_ATTEMPTS` | Optional. Total attempts (1–5) for an outbound Graph API call (read or write) before giving up on a retryable status (429/5xx). Defaults to `2`. Honors a `Retry-After` response header from Graph when present, in either delay-seconds or HTTP-date form. |
 | `ATTACHMENT_MAX_MB` | Optional. Max attachment size (1–25MB, decoded) `get_attachment` will fetch. Defaults to `3`. Attachment bytes return as base64 text inside the MCP tool result — straight into the calling LLM's context, not just over the network. |
+| `PORT` | Optional. Port the server listens on. Defaults to `8000`. |
 
 ## Read-only accounts
 

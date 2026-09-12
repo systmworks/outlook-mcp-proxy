@@ -84,7 +84,39 @@ host with HTTPS works the same way — substitute your own reverse proxy/TLS set
    systemctl daemon-reload
    systemctl enable --now outlook-mcp-proxy
    ```
-7. Verify it's up:
+7. **Enable Tailscale Funnel.** `tailscale up` (step 3) only makes the server reachable
+   *within your own tailnet* — Claude's servers aren't part of it, so plain Tailscale
+   visibility isn't enough. Funnel is what makes it genuinely public over HTTPS via
+   Tailscale's relay:
+   ```bash
+   tailscale funnel 8000
+   ```
+   On some Tailscale versions this doesn't persist once the foreground process exits
+   (`tailscale funnel status` reports "No serve config" after Ctrl-C) — if that happens,
+   keep it running via its own systemd unit instead, e.g.
+   `/etc/systemd/system/tailscale-funnel.service`:
+   ```ini
+   [Unit]
+   Description=Tailscale Funnel for outlook-mcp-proxy
+   After=network.target tailscaled.service outlook-mcp-proxy.service
+   Requires=tailscaled.service
+
+   [Service]
+   Type=simple
+   ExecStart=/usr/bin/tailscale funnel 8000
+   Restart=on-failure
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   ```bash
+   systemctl daemon-reload
+   systemctl enable --now tailscale-funnel
+   ```
+   Note: under some Tailscale versions run non-interactively (e.g. via systemd),
+   `tailscale funnel status` may still report "No serve config" even when Funnel is
+   genuinely working — trust the curl test in the next step over that status output.
+8. Verify it's up:
    ```bash
    curl https://<your-tailscale-hostname>/.well-known/oauth-authorization-server
    ```

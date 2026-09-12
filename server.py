@@ -335,6 +335,35 @@ async def _call_list(method: str, url: str, **kwargs: Any) -> list[dict]:
     return r.json().get("value", [])
 
 
+_MAX_PAGINATION_PAGES = 50  # hard cap — mirrors depth<6 in list_folders' recursive walk;
+                             # a self-referential or never-terminating @odata.nextLink
+                             # (e.g. from a misbehaving proxy/cache) must not hang a call forever.
+
+
+async def _call_list_all(method: str, url: str, *, headers: dict | None = None,
+                         **kwargs: Any) -> list[dict]:
+    """Like _call_list, but follows @odata.nextLink until exhausted (or
+    _MAX_PAGINATION_PAGES pages, whichever comes first) instead of returning
+    just the first page. Use this only where the caller needs the COMPLETE
+    collection to behave correctly (e.g. enumerating every child folder) —
+    everywhere else, a tool's own $top/max_results is a deliberate page size
+    the caller chose, not an accidental truncation to fix. headers (e.g. a
+    Prefer header) are resent on every page; params/other kwargs only on the
+    first — nextLink already encodes the full query string for later pages."""
+    items: list[dict] = []
+    next_url: str | None = url
+    first = True
+    pages = 0
+    while next_url and pages < _MAX_PAGINATION_PAGES:
+        r = await _call(method, next_url, headers=headers, **(kwargs if first else {}))
+        body = r.json()
+        items.extend(body.get("value", []))
+        next_url = body.get("@odata.nextLink")
+        first = False
+        pages += 1
+    return items
+
+
 def _require_write() -> None:
     if _read_only.get():
         raise PermissionError("this connection is authorized read-only; write actions are disabled")
@@ -493,7 +522,12 @@ async def get_attachment(message_id: str, attachment_id: str) -> dict:
         )
 
     full = await _call("GET", f"{ME}/messages/{_enc(message_id)}/attachments/{_enc(attachment_id)}")
-    content_bytes = full.json().get("contentBytes", "")
+    content_bytes = full.json().get("contentBytes")
+    if content_bytes is None:
+        raise ValueError(
+            f"attachment {filename!r} has no downloadable content — it may be a "
+            f"reference (e.g. a OneDrive link) or item attachment rather than a file"
+        )
     raw = base64.b64decode(content_bytes)
     if len(raw) > ATTACHMENT_MAX_BYTES:
         raise ValueError(
@@ -573,8 +607,12 @@ async def delete_draft(draft_id: str) -> dict:
 
 
 async def _list_child_folders(folder_id: str | None) -> list[dict]:
+    # Graph pages mailFolders results (observed: exactly 100 per page) — follow
+    # @odata.nextLink for the full set, or a mailbox with more children than one
+    # page holds (this feature exists specifically for large mailboxes) silently
+    # loses the rest with no indication to the caller that more exist.
     url = f"{ME}/mailFolders" if folder_id is None else f"{ME}/mailFolders/{_enc(folder_id)}/childFolders"
-    return await _call_list("GET", url, params={"$top": 100})
+    return await _call_list_all("GET", url, params={"$top": 100})
 
 
 _LIST_FOLDERS_MAX = 200  # hard safety cap — see docstring

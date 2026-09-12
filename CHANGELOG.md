@@ -9,6 +9,49 @@ tracked in git commit history only, not here.
 
 ## 2026-09-12
 
+### 0.10 — Fourth review pass: bound pagination, fix attachment edge case
+
+A fourth review pass, focused specifically on 0.9's brand-new pagination code
+(the part of the codebase least scrutinized by the prior three rounds), found
+it had introduced a new class of risk while fixing the old one.
+
+**Fixed**
+- `_call_list_all`'s pagination loop had no bound on page count — unlike
+  every other loop in this file (`API_RETRY_ATTEMPTS`, `list_folders`'
+  `depth < 6` guard). A self-referential or never-terminating
+  `@odata.nextLink` (e.g. from a misbehaving proxy/cache) would have hung a
+  tool call forever. Added `_MAX_PAGINATION_PAGES` (50) as a hard cap.
+- `_call_list_all` silently dropped any caller-supplied `headers` (e.g. a
+  `Prefer` header) from page 2 onward — harmless today since its only caller
+  passes none, but a latent trap for the next one. `headers` are now resent
+  on every page; `params`/other kwargs still only on the first, since
+  `@odata.nextLink` already encodes the full query string.
+- `get_attachment` treated a missing `contentBytes` (e.g. a
+  `referenceAttachment` — a OneDrive link — or certain `itemAttachment`
+  types, neither of which carry downloadable bytes at this endpoint) as a
+  valid 0-byte download instead of a clear error.
+
+### 0.9 — Fix silent folder-listing truncation beyond one Graph page
+
+Asking "how many folders are in the mailbox" surfaced a real bug: `list_folders()`
+(top-level) returned exactly 100 folders, and `list_folders(recursive=True)`
+returned exactly 200 — both suspiciously round numbers that turned out to be
+truncation artifacts, not real counts.
+
+**Fixed**
+- `_list_child_folders` requested Graph with `$top=100` but never followed
+  `@odata.nextLink` for further pages, so any single folder (including the
+  mailbox root) with more than 100 direct children silently lost the rest —
+  with no indication to the caller that more existed. This directly
+  undermined the large-mailbox support `list_folders` was built for (0.2):
+  the outer 200-item safety cap assumes it's capping a *complete* walk, but
+  the per-level fetch was losing folders before that cap even applied.
+- Added `_call_list_all()` — follows `@odata.nextLink` until exhausted — and
+  switched `_list_child_folders` to use it instead of `_call_list`. Every
+  other tool's use of `_call_list` is left unchanged: their `$top`/
+  `max_results` is a deliberate page size the caller (the LLM) chose, not an
+  accidental truncation to fix.
+
 ### 0.8 — Third review pass: alias-binding fix + duplication cleanup
 
 A third review pass (correctness + "does every line pull its weight?")
@@ -168,6 +211,16 @@ REST URL paths; and a narrow-window race where `_purge_expired_tokens` can
 pop a session's token entry while `_refresh` is still awaiting Microsoft's
 response for it. All three were confirmed and fixed in 0.6 below.
 
+### 0.4 — Confirm move_folder id behavior
+
+Live-tested against the real mailbox: created a throwaway top-level folder,
+moved it under Inbox, and compared ids. The returned `id` was identical
+before and after the move — only `parentFolderId` changed.
+
+**Changed**
+- `move_folder` docstring now states as fact that a moved folder keeps its
+  original id, rather than flagging it as unconfirmed.
+
 ### 0.3 — Add move_folder
 
 Requested after live use surfaced the need to re-parent folders (e.g. moving
@@ -181,16 +234,6 @@ Graph supports this via the same `move` action shape as `move_message`
   same as every other write tool. Unlike `move_message`, Graph's own docs
   don't state whether the folder keeps its id or gets a new one on move;
   flagged in the docstring as unconfirmed pending real-world verification.
-
-### 0.4 — Confirm move_folder id behavior
-
-Live-tested against the real mailbox: created a throwaway top-level folder,
-moved it under Inbox, and compared ids. The returned `id` was identical
-before and after the move — only `parentFolderId` changed.
-
-**Changed**
-- `move_folder` docstring now states as fact that a moved folder keeps its
-  original id, rather than flagging it as unconfirmed.
 
 ### 0.2 — Fix list_folders for large mailboxes
 
