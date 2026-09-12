@@ -48,7 +48,7 @@ different Microsoft account.
 | `send_draft` | Send an existing draft |
 | `update_draft` | Replace the content of an existing draft |
 | `delete_draft` | Permanently delete a draft |
-| `list_folders` | All mail folders, including nested custom folders |
+| `list_folders` | Top-level folders by default; pass `parent_folder_id` (a folder id, or a well-known name like `"inbox"`) to drill into one, `recursive=True` to walk the whole subtree, or `name_contains` to search by name (capped at 200 results) |
 | `create_folder` | Create a folder, optionally nested |
 | `update_folder` | Rename a folder |
 | `delete_folder` | Permanently delete a folder |

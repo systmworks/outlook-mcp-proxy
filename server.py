@@ -555,26 +555,49 @@ async def _list_child_folders(folder_id: str | None) -> list[dict]:
     return r.json().get("value", [])
 
 
+_LIST_FOLDERS_MAX = 200  # hard safety cap — see docstring
+
+
 @mcp.tool
-async def list_folders() -> list[dict]:
-    """List all mail folders, including nested custom folders, as a flat list
-    (each item carries parentFolderId — unlike Gmail's flat "/"-named labels,
-    Outlook folders have a real hierarchy; reconstruct the tree from that field
-    if you need it)."""
+async def list_folders(parent_folder_id: str = "", recursive: bool = False,
+                       name_contains: str = "") -> list[dict]:
+    """List mail folders (each item carries parentFolderId — unlike Gmail's flat
+    "/"-named labels, Outlook folders have a real hierarchy).
+
+    By default, returns only the immediate children of the root (top-level
+    folders like Inbox/Drafts/Sent Items themselves, not what's inside them).
+    parent_folder_id lists one specific folder's immediate children instead —
+    it accepts a real folder id or a well-known name ("inbox", "archive",
+    "junkemail", "deleteditems", etc.), so parent_folder_id="inbox" is a common
+    starting point for a mailbox organized as subfolders directly under Inbox.
+    recursive=True walks the whole subtree from there (or from the root, if
+    parent_folder_id is also omitted) instead of just one level. name_contains
+    filters the result by a case-insensitive substring match on displayName —
+    combine it with recursive=True to search the whole tree by name in one
+    call (e.g. a mailbox organized into hundreds of per-project subfolders)
+    instead of walking down level by level.
+
+    A mailbox can have far more folders than fit in one tool result — the
+    result is capped at 200 folders regardless of the above; narrow with
+    parent_folder_id/name_contains if you hit that cap."""
     folders: list[dict] = []
-    frontier = await _list_child_folders(None)
+    frontier = await _list_child_folders(parent_folder_id or None)
     folders.extend(frontier)
-    depth = 0
-    while frontier and depth < 6:  # guards against pathological nesting
-        depth += 1
-        next_frontier: list[dict] = []
-        for parent in frontier:
-            if parent.get("childFolderCount", 0) > 0:
-                children = await _list_child_folders(parent["id"])
-                folders.extend(children)
-                next_frontier.extend(children)
-        frontier = next_frontier
-    return folders
+    if recursive:
+        depth = 0
+        while frontier and depth < 6:  # guards against pathological nesting
+            depth += 1
+            next_frontier: list[dict] = []
+            for parent in frontier:
+                if parent.get("childFolderCount", 0) > 0:
+                    children = await _list_child_folders(parent["id"])
+                    folders.extend(children)
+                    next_frontier.extend(children)
+            frontier = next_frontier
+    if name_contains:
+        needle = name_contains.casefold()
+        folders = [f for f in folders if needle in f.get("displayName", "").casefold()]
+    return folders[:_LIST_FOLDERS_MAX]
 
 
 @mcp.tool

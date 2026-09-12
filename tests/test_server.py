@@ -163,16 +163,59 @@ async def test_write_tools_reject_read_only_sessions(tool_name, args):
 # ── folders / categories / move ──────────────────────────────────────────────
 
 @respx.mock
-async def test_list_folders_walks_nested_children():
+async def test_list_folders_defaults_to_top_level_only():
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "top", "displayName": "Top", "childFolderCount": 1}],
+    }))
+    # No mock registered for .../top/childFolders — if list_folders() walked
+    # into it by default, respx would raise for the unmocked request.
+    folders = await server.list_folders()
+    assert [f["id"] for f in folders] == ["top"]
+
+
+@respx.mock
+async def test_list_folders_recursive_walks_nested_children():
     respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
         "value": [{"id": "top", "displayName": "Top", "childFolderCount": 1}],
     }))
     respx.get(f"{server.ME}/mailFolders/top/childFolders").mock(return_value=httpx.Response(200, json={
         "value": [{"id": "child", "displayName": "Child", "childFolderCount": 0}],
     }))
-    folders = await server.list_folders()
+    folders = await server.list_folders(recursive=True)
     ids = {f["id"] for f in folders}
     assert ids == {"top", "child"}
+
+
+@respx.mock
+async def test_list_folders_parent_folder_id_lists_one_level_of_children():
+    route = respx.get(f"{server.ME}/mailFolders/parent1/childFolders").mock(
+        return_value=httpx.Response(200, json={
+            "value": [{"id": "child1", "displayName": "Child 1", "childFolderCount": 0}],
+        })
+    )
+    folders = await server.list_folders(parent_folder_id="parent1")
+    assert [f["id"] for f in folders] == ["child1"]
+    assert route.called
+
+
+@respx.mock
+async def test_list_folders_name_contains_filters_case_insensitively():
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [
+            {"id": "a", "displayName": "Lot 033", "childFolderCount": 0},
+            {"id": "b", "displayName": "Correspondence", "childFolderCount": 0},
+        ],
+    }))
+    folders = await server.list_folders(name_contains="lot 033")
+    assert [f["id"] for f in folders] == ["a"]
+
+
+@respx.mock
+async def test_list_folders_caps_result_at_safety_limit():
+    many = [{"id": str(i), "displayName": f"Folder {i}", "childFolderCount": 0} for i in range(500)]
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={"value": many}))
+    folders = await server.list_folders()
+    assert len(folders) == server._LIST_FOLDERS_MAX
 
 
 @respx.mock

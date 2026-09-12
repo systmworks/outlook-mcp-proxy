@@ -9,6 +9,26 @@ tracked in git commit history only, not here.
 
 ## 2026-09-12
 
+### 0.2 — Fix list_folders for large mailboxes
+
+Live testing against a real mailbox organized into hundreds of per-property
+subfolders (385 folders total) found `list_folders()` exceeding the calling
+session's output limit — it was the one list tool in this codebase with no
+size cap at all, always walking the entire folder tree.
+
+**Changed**
+- `list_folders()` now defaults to top-level folders only, instead of
+  recursively walking the whole tree.
+- Added `parent_folder_id` (list one folder's immediate children — drill down
+  one level at a time) and `recursive` (opt into the old whole-tree walk,
+  from `parent_folder_id` or the root) parameters.
+- Added `name_contains` (case-insensitive substring filter on `displayName`),
+  most useful paired with `recursive=True` to search the whole tree by name in
+  one call rather than walking down level by level.
+- Added a hard 200-item cap on the result regardless of the above, as a
+  last-resort guard against ever exceeding the calling session's output
+  budget again.
+
 ### 0.1 — Initial implementation
 
 Sibling project to [gmail-mcp-proxy](https://github.com/systmworks/gmail-mcp-proxy),
