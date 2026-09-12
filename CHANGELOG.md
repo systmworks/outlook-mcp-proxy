@@ -7,6 +7,30 @@ version order, starting at 0.1. Administrative changes (documentation, README/SE
 CI/tooling config, LICENSE, dependency pins, changelog maintenance itself, etc.) are
 tracked in git commit history only, not here.
 
+## 2026-09-13
+
+### 0.11 — Trim list_folders payload, add count_folders
+
+Prompted by the token cost of `list_folders(recursive=True)` over a mailbox
+with hundreds of subfolders — most of that cost is per-folder fields
+(`unreadItemCount`/`totalItemCount`) the caller doesn't use when the actual
+goal is just "what's the structure" or "how many folders are there", not
+full per-folder detail.
+
+**Added**
+- `list_folders(minimal=True)` — trims Graph's `$select` to
+  `id,displayName,parentFolderId,childFolderCount`, dropping
+  `unreadItemCount`/`totalItemCount`. `displayName` stays selected, so
+  `name_contains` is unaffected. Default (`minimal=False`) sends no
+  `$select` at all, identical to prior behavior — no regression for
+  existing callers.
+- `count_folders(parent_folder_id="")` — walks the folder tree server-side
+  (same recursive BFS and `depth < 6` guard as `list_folders`) requesting
+  only `id,childFolderCount` per folder, and returns just
+  `{"total", "depth_reached", "truncated"}` instead of the folder list
+  itself. `truncated=True` if the depth guard was hit, so a capped walk is
+  never silently reported as a complete count.
+
 ## 2026-09-12
 
 ### 0.10 — Fourth review pass: bound pagination, fix attachment edge case

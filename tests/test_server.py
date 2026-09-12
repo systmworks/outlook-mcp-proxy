@@ -348,6 +348,85 @@ async def test_list_folders_caps_result_at_safety_limit():
 
 
 @respx.mock
+async def test_list_folders_default_sends_no_select():
+    route = respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "a", "displayName": "A", "childFolderCount": 0}],
+    }))
+    await server.list_folders()
+    assert "$select" not in route.calls.last.request.url.params
+
+
+@respx.mock
+async def test_list_folders_minimal_trims_select():
+    route = respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "a", "displayName": "A", "childFolderCount": 0}],
+    }))
+    await server.list_folders(minimal=True)
+    assert route.calls.last.request.url.params["$select"] == server._LIST_FOLDERS_MINIMAL_SELECT
+
+
+@respx.mock
+async def test_list_folders_minimal_preserves_name_contains():
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [
+            {"id": "a", "displayName": "Lot 033", "childFolderCount": 0},
+            {"id": "b", "displayName": "Correspondence", "childFolderCount": 0},
+        ],
+    }))
+    folders = await server.list_folders(minimal=True, name_contains="lot 033")
+    assert [f["id"] for f in folders] == ["a"]
+
+
+@respx.mock
+async def test_count_folders_sums_full_subtree():
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "top", "childFolderCount": 1}],
+    }))
+    respx.get(f"{server.ME}/mailFolders/top/childFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "child", "childFolderCount": 0}],
+    }))
+    result = await server.count_folders()
+    assert result == {"total": 2, "depth_reached": 2, "truncated": False}
+
+
+@respx.mock
+async def test_count_folders_requests_minimal_select():
+    route = respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "a", "childFolderCount": 0}],
+    }))
+    await server.count_folders()
+    assert route.calls.last.request.url.params["$select"] == server._COUNT_FOLDERS_SELECT
+
+
+@respx.mock
+async def test_count_folders_scopes_to_parent_folder_id():
+    # No mock registered for the root /mailFolders — if count_folders ever
+    # touched it instead of staying scoped to parent_folder_id, respx would
+    # raise for the unmocked request.
+    respx.get(f"{server.ME}/mailFolders/parent1/childFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "child1", "childFolderCount": 0}],
+    }))
+    result = await server.count_folders(parent_folder_id="parent1")
+    assert result["total"] == 1
+
+
+@respx.mock
+async def test_count_folders_sets_truncated_at_depth_guard():
+    # A 7-deep chain (L0..L6, each with childFolderCount=1) — L6's own
+    # children (L7) are never mocked, proving the depth<6 guard stops the
+    # walk before reaching them rather than silently fetching forever.
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
+        "value": [{"id": "L0", "childFolderCount": 1}],
+    }))
+    for n in range(6):
+        respx.get(f"{server.ME}/mailFolders/L{n}/childFolders").mock(return_value=httpx.Response(200, json={
+            "value": [{"id": f"L{n + 1}", "childFolderCount": 1}],
+        }))
+    result = await server.count_folders()
+    assert result == {"total": 7, "depth_reached": 6, "truncated": True}
+
+
+@respx.mock
 async def test_update_categories_merges_add_and_remove():
     respx.get(f"{server.ME}/messages/m1").mock(return_value=httpx.Response(200, json={
         "categories": ["Red", "Blue"],

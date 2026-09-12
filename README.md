@@ -49,7 +49,8 @@ different Microsoft account.
 | `send_draft` | Send an existing draft |
 | `update_draft` | Replace the content of an existing draft |
 | `delete_draft` | Permanently delete a draft |
-| `list_folders` | Top-level folders by default; pass `parent_folder_id` (a folder id, or a well-known name like `"inbox"`) to drill into one, `recursive=True` to walk the whole subtree, or `name_contains` to search by name (capped at 200 results) |
+| `list_folders` | Top-level folders by default; pass `parent_folder_id` (a folder id, or a well-known name like `"inbox"`) to drill into one, `recursive=True` to walk the whole subtree, `name_contains` to search by name, or `minimal=True` to trim the per-folder fields returned (cheaper for large recursive walks) — capped at 200 results |
+| `count_folders` | Count folders in the mailbox (or one subtree via `parent_folder_id`) without returning the list itself — cheaper than `list_folders(recursive=True)` when the question is just "how many" |
 | `create_folder` | Create a folder, optionally nested |
 | `update_folder` | Rename a folder |
 | `delete_folder` | Permanently delete a folder |

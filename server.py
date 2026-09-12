@@ -606,21 +606,26 @@ async def delete_draft(draft_id: str) -> dict:
     return {"deleted": draft_id}
 
 
-async def _list_child_folders(folder_id: str | None) -> list[dict]:
+async def _list_child_folders(folder_id: str | None, select: str | None = None) -> list[dict]:
     # Graph pages mailFolders results (observed: exactly 100 per page) — follow
     # @odata.nextLink for the full set, or a mailbox with more children than one
     # page holds (this feature exists specifically for large mailboxes) silently
     # loses the rest with no indication to the caller that more exist.
     url = f"{ME}/mailFolders" if folder_id is None else f"{ME}/mailFolders/{_enc(folder_id)}/childFolders"
-    return await _call_list_all("GET", url, params={"$top": 100})
+    params: dict[str, Any] = {"$top": 100}
+    if select:
+        params["$select"] = select
+    return await _call_list_all("GET", url, params=params)
 
 
 _LIST_FOLDERS_MAX = 200  # hard safety cap — see docstring
+_LIST_FOLDERS_MINIMAL_SELECT = "id,displayName,parentFolderId,childFolderCount"
+_COUNT_FOLDERS_SELECT = "id,childFolderCount"
 
 
 @mcp.tool
 async def list_folders(parent_folder_id: str = "", recursive: bool = False,
-                       name_contains: str = "") -> list[dict]:
+                       name_contains: str = "", minimal: bool = False) -> list[dict]:
     """List mail folders (each item carries parentFolderId — unlike Gmail's flat
     "/"-named labels, Outlook folders have a real hierarchy).
 
@@ -637,24 +642,67 @@ async def list_folders(parent_folder_id: str = "", recursive: bool = False,
     call (e.g. a mailbox organized into hundreds of per-project subfolders)
     instead of walking down level by level.
 
+    minimal=True drops unreadItemCount/totalItemCount from each returned
+    folder, keeping only id/displayName/parentFolderId/childFolderCount — use
+    this with recursive=True over a large tree when you only care about
+    structure or names, not per-folder unread stats, to cut the result's
+    token cost. name_contains still works unchanged under minimal=True,
+    since displayName is always kept. If you don't need names or ids at all
+    and just want a count, use count_folders instead — it's cheaper still.
+
     A mailbox can have far more folders than fit in one tool result — the
     result is capped at 200 folders regardless of the above; narrow with
     parent_folder_id/name_contains if you hit that cap."""
+    select = _LIST_FOLDERS_MINIMAL_SELECT if minimal else None
     folders: list[dict] = []
-    frontier = await _list_child_folders(parent_folder_id or None)
+    frontier = await _list_child_folders(parent_folder_id or None, select=select)
     folders.extend(frontier)
     if recursive:
         depth = 0
         while frontier and depth < 6:  # guards against pathological nesting
             depth += 1
             parents = [p for p in frontier if p.get("childFolderCount", 0) > 0]
-            results = await asyncio.gather(*(_list_child_folders(p["id"]) for p in parents))
+            results = await asyncio.gather(
+                *(_list_child_folders(p["id"], select=select) for p in parents)
+            )
             frontier = [child for children in results for child in children]
             folders.extend(frontier)
     if name_contains:
         needle = name_contains.casefold()
         folders = [f for f in folders if needle in f.get("displayName", "").casefold()]
     return folders[:_LIST_FOLDERS_MAX]
+
+
+@mcp.tool
+async def count_folders(parent_folder_id: str = "") -> dict:
+    """Count every folder in the mailbox (or one subtree), without returning
+    the folders themselves — for when the actual question is "how many
+    folders are there", not their names or ids. Cheaper than
+    list_folders(recursive=True) in two ways: each Graph request asks only
+    for id/childFolderCount (not name, parent, or unread stats), and the tool
+    result itself is a handful of numbers instead of a potentially-large list
+    of folder objects.
+
+    parent_folder_id scopes the count to one subtree (a folder id, or a
+    well-known name like "inbox"), same as list_folders; omit it to count the
+    whole mailbox. The walk shares list_folders' depth<6 guard against
+    pathological nesting — if that guard is hit, truncated is True and total
+    is a lower bound (folders beyond depth 6 are not counted), never a
+    silently-wrong exact-looking number."""
+    total = 0
+    frontier = await _list_child_folders(parent_folder_id or None, select=_COUNT_FOLDERS_SELECT)
+    total += len(frontier)
+    depth = 0
+    while frontier and depth < 6:
+        depth += 1
+        parents = [p for p in frontier if p.get("childFolderCount", 0) > 0]
+        results = await asyncio.gather(
+            *(_list_child_folders(p["id"], select=_COUNT_FOLDERS_SELECT) for p in parents)
+        )
+        frontier = [child for children in results for child in children]
+        total += len(frontier)
+    truncated = bool(frontier) and depth >= 6
+    return {"total": total, "depth_reached": depth, "truncated": truncated}
 
 
 @mcp.tool
