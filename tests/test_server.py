@@ -451,7 +451,7 @@ async def test_update_categories_merges_add_and_remove():
     import json
     body = json.loads(sent)
     assert sorted(body["categories"]) == ["Blue", "Green"]
-    assert result["categories"] == ["Blue", "Green"]
+    assert result == {"id": "m1", "categories": ["Blue", "Green"]}
 
 
 @respx.mock
@@ -464,6 +464,21 @@ async def test_move_message_returns_new_message_id():
     result = await server.move_message("m1", "archive")
     assert result["id"] == "m1-new-id-after-move"
     assert result["id"] != "m1"
+
+
+@respx.mock
+async def test_move_message_strips_full_body_from_response():
+    # Regression test: Graph's /move action ignores $select and always returns
+    # the complete moved message (full HTML body included) — the tool result
+    # must trim that down in Python instead of passing it straight through,
+    # or the LLM context burns tokens on an email body it never asked to see.
+    respx.post(f"{server.ME}/messages/m1/move").mock(return_value=httpx.Response(200, json={
+        "id": "m2", "parentFolderId": "archive-id",
+        "body": {"contentType": "html", "content": "<html>" + "x" * 10_000 + "</html>"},
+        "subject": "Subj", "bodyPreview": "preview",
+    }))
+    result = await server.move_message("m1", "archive")
+    assert result == {"id": "m2", "parentFolderId": "archive-id"}
 
 
 @respx.mock
@@ -501,6 +516,36 @@ async def test_trash_message_moves_to_deleted_items():
 
 
 @respx.mock
+async def test_create_draft_strips_full_body_from_response():
+    # Same Graph quirk as move: POST /messages ignores $select and always
+    # returns the full created message (full body). create_draft must not
+    # hand that straight back to the caller.
+    respx.post(f"{server.ME}/messages").mock(return_value=httpx.Response(200, json={
+        "id": "d1",
+        "subject": "Subj",
+        "toRecipients": [{"emailAddress": {"address": "a@example.com"}}],
+        "bodyPreview": "preview",
+        "parentFolderId": "drafts-id",
+        "body": {"contentType": "html", "content": "<html>" + "x" * 10_000 + "</html>"},
+    }))
+    result = await server.create_draft("a@example.com", "Subj", "Body")
+    assert "body" not in result
+    assert result == {
+        "id": "d1", "subject": "Subj", "to": ["a@example.com"], "cc": [],
+        "bodyPreview": "preview", "parentFolderId": "drafts-id",
+    }
+
+
+@respx.mock
+async def test_list_drafts_sends_select():
+    route = respx.get(f"{server.ME}/mailFolders/drafts/messages").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    await server.list_drafts()
+    assert route.calls.last.request.url.params["$select"] == server._MESSAGE_SELECT
+
+
+@respx.mock
 async def test_delete_draft_handles_204_no_content():
     respx.delete(f"{server.ME}/messages/d1").mock(return_value=httpx.Response(204))
     result = await server.delete_draft("d1")
@@ -529,6 +574,40 @@ async def test_search_events_uses_events_endpoint_not_calendar_view():
     results = await server.search_events("standup")
     assert results == [{"id": "e1"}]
     assert route.calls.last.request.url.params["$search"] == '"standup"'
+
+
+@respx.mock
+async def test_list_events_sends_select_excluding_body():
+    route = respx.get(f"{server.ME}/calendarView").mock(return_value=httpx.Response(200, json={
+        "value": [],
+    }))
+    await server.list_events(time_min="2026-01-01T00:00:00Z", time_max="2026-01-31T00:00:00Z")
+    select = route.calls.last.request.url.params["$select"]
+    assert select == server._EVENT_SELECT
+    assert "body" not in select.split(",")
+
+
+@respx.mock
+async def test_search_events_sends_select():
+    route = respx.get(f"{server.ME}/events").mock(return_value=httpx.Response(200, json={"value": []}))
+    await server.search_events("standup")
+    assert route.calls.last.request.url.params["$select"] == server._EVENT_SELECT
+
+
+@respx.mock
+async def test_get_event_sends_detail_select_including_body():
+    route = respx.get(f"{server.ME}/events/e1").mock(return_value=httpx.Response(200, json={"id": "e1"}))
+    await server.get_event("e1")
+    select = route.calls.last.request.url.params["$select"]
+    assert select == server._EVENT_DETAIL_SELECT
+    assert "body" in select.split(",")
+
+
+@respx.mock
+async def test_list_calendars_sends_select():
+    route = respx.get(f"{server.ME}/calendars").mock(return_value=httpx.Response(200, json={"value": []}))
+    await server.list_calendars()
+    assert route.calls.last.request.url.params["$select"] == server._CALENDAR_SELECT
 
 
 @respx.mock

@@ -415,6 +415,29 @@ def _build_message(subject: str, body: str, to: str, cc: str = "") -> dict:
     return message
 
 
+def _draft_summary(data: dict) -> dict:
+    """Graph ignores $select on POST/PATCH — a create/update draft call always
+    returns the complete message resource (full body included) no matter what
+    query params are sent. Trim it down here in Python instead, since the
+    caller already knows what it just wrote and only needs enough back to
+    confirm it and to address the draft in later calls (send_draft etc.)."""
+    return {
+        "id": data["id"],
+        "subject": data.get("subject", ""),
+        "to": [r["emailAddress"]["address"] for r in data.get("toRecipients", [])],
+        "cc": [r["emailAddress"]["address"] for r in data.get("ccRecipients", [])],
+        "bodyPreview": data.get("bodyPreview", ""),
+        "parentFolderId": data.get("parentFolderId", ""),
+    }
+
+
+def _move_summary(data: dict) -> dict:
+    """Same story as _draft_summary: the /move action ignores $select and
+    always returns the complete moved message (full body). Only the new id and
+    destination are ever useful from that response."""
+    return {"id": data["id"], "parentFolderId": data.get("parentFolderId", "")}
+
+
 def _calendar_base(calendar_id: str) -> str:
     return ME if calendar_id == "primary" else f"{ME}/calendars/{_enc(calendar_id)}"
 
@@ -591,13 +614,16 @@ async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     _require_write()
     message = _build_message(subject, body, to, cc)
     r = await _call("POST", f"{ME}/messages", json=message)
-    return r.json()
+    return _draft_summary(r.json())
 
 
 @mcp.tool
 async def list_drafts(max_results: int = 10) -> list[dict]:
     """List draft emails."""
-    return await _call_list("GET", f"{ME}/mailFolders/drafts/messages", params={"$top": max_results})
+    return await _call_list("GET", f"{ME}/mailFolders/drafts/messages", params={
+        "$top": max_results,
+        "$select": _MESSAGE_SELECT,
+    })
 
 
 @mcp.tool
@@ -615,7 +641,7 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
     _require_write()
     message = _build_message(subject, body, to, cc)
     r = await _call("PATCH", f"{ME}/messages/{_enc(draft_id)}", json=message)
-    return r.json()
+    return _draft_summary(r.json())
 
 
 @mcp.tool
@@ -789,7 +815,9 @@ async def update_categories(message_id: str, add: list[str] | None = None,
     current -= set(remove or [])
     r2 = await _call("PATCH", f"{ME}/messages/{_enc(message_id)}",
                      json={"categories": sorted(current)})
-    return r2.json()
+    # A category update never changes the message id (unlike /move), so use
+    # the id already known rather than assuming the mocked/real response echoes it.
+    return {"id": message_id, "categories": r2.json().get("categories", [])}
 
 
 @mcp.tool
@@ -802,7 +830,7 @@ async def move_message(message_id: str, destination_folder_id: str) -> dict:
     _require_write()
     r = await _call("POST", f"{ME}/messages/{_enc(message_id)}/move",
                     json={"destinationId": destination_folder_id})
-    return r.json()
+    return _move_summary(r.json())
 
 
 @mcp.tool
@@ -812,7 +840,7 @@ async def mark_as_junk(message_id: str) -> dict:
     this just relocates the message, same as Gmail's did)."""
     _require_write()
     r = await _call("POST", f"{ME}/messages/{_enc(message_id)}/move", json={"destinationId": "junkemail"})
-    return r.json()
+    return _move_summary(r.json())
 
 
 @mcp.tool
@@ -822,13 +850,27 @@ async def trash_message(message_id: str) -> dict:
     _require_write()
     r = await _call("POST", f"{ME}/messages/{_enc(message_id)}/move",
                     json={"destinationId": "deleteditems"})
-    return r.json()
+    return _move_summary(r.json())
+
+
+_CALENDAR_SELECT = "id,name,color,isDefaultCalendar,canEdit,owner"
+
+# Excludes the verbose Graph event metadata (@odata.etag, iCalUId, uid,
+# transactionId, allowNewTimeProposals, reminderMinutesBeforeStart, etc.) that
+# list/search callers never use — and excludes the full HTML `body`, keeping
+# only bodyPreview, same trade-off list_messages makes for mail.
+_EVENT_SELECT = ("id,subject,start,end,location,isAllDay,organizer,attendees,"
+                 "bodyPreview,categories,seriesMasterId,isOnlineMeeting,onlineMeeting")
+
+# get_event is a single-item fetch (like read_message) — worth the extra body/
+# recurrence/webLink fields that list/search deliberately drop above.
+_EVENT_DETAIL_SELECT = _EVENT_SELECT + ",body,recurrence,webLink"
 
 
 @mcp.tool
 async def list_calendars() -> list[dict]:
     """List all calendars on the account."""
-    return await _call_list("GET", f"{ME}/calendars")
+    return await _call_list("GET", f"{ME}/calendars", params={"$select": _CALENDAR_SELECT})
 
 
 @mcp.tool
@@ -844,7 +886,8 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
     return await _call_list(
         "GET", f"{_calendar_base(calendar_id)}/calendarView",
         headers={"Prefer": 'outlook.timezone="UTC"'},
-        params={"startDateTime": start, "endDateTime": end, "$top": max_results})
+        params={"startDateTime": start, "endDateTime": end, "$top": max_results,
+                "$select": _EVENT_SELECT})
 
 
 @mcp.tool
@@ -855,13 +898,15 @@ async def search_events(query: str, calendar_id: str = "primary",
     series itself, not each future instance."""
     return await _call_list(
         "GET", f"{_calendar_base(calendar_id)}/events",
-        params={"$search": f'"{_escape_search_phrase(query)}"', "$top": max_results})
+        params={"$search": f'"{_escape_search_phrase(query)}"', "$top": max_results,
+                "$select": _EVENT_SELECT})
 
 
 @mcp.tool
 async def get_event(event_id: str, calendar_id: str = "primary") -> dict:
     """Get a specific calendar event by ID."""
-    r = await _call("GET", f"{_calendar_base(calendar_id)}/events/{_enc(event_id)}")
+    r = await _call("GET", f"{_calendar_base(calendar_id)}/events/{_enc(event_id)}",
+                    params={"$select": _EVENT_DETAIL_SELECT})
     return r.json()
 
 
