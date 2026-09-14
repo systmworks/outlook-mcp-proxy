@@ -7,6 +7,41 @@ version order, starting at 0.1. Administrative changes (documentation, README/SE
 CI/tooling config, LICENSE, dependency pins, changelog maintenance itself, etc.) are
 tracked in git commit history only, not here.
 
+## 2026-09-14
+
+### 0.13 — Stop returning full message bodies from write/action tool results
+
+Prompted by noticing `move_message` responses burning tokens on the entire
+email body. Graph's `$select` only applies to GET requests — POST/PATCH and
+action endpoints like `/move` ignore it and always return the complete
+resource, body included, no matter what query params are sent.
+
+**Fixed**
+- `move_message`, `mark_as_junk`, `trash_message` — all hit the same `/move`
+  action; each now trims Graph's full-message response down to
+  `{id, parentFolderId}` in Python via a new `_move_summary()` helper, instead
+  of passing the raw response (full HTML body and all) straight through.
+- `create_draft`, `update_draft` — same POST/PATCH `$select`-ignoring
+  behavior; now trimmed via `_draft_summary()` to
+  `{id, subject, to, cc, bodyPreview, parentFolderId}`.
+- `update_categories` — PATCH response trimmed to `{id, categories}`; `id` is
+  taken from the input `message_id` rather than the response, since a
+  category update never changes it (unlike `/move`).
+
+**Added `$select` to GET endpoints that had none at all** (event objects in
+particular carry a lot of Graph metadata plus a full HTML body that list/search
+callers never use):
+- `list_drafts` — now uses the existing `_MESSAGE_SELECT`.
+- `list_calendars` — new `_CALENDAR_SELECT`.
+- `list_events`, `search_events` — new `_EVENT_SELECT` (excludes body,
+  keeps `bodyPreview`).
+- `get_event` — new `_EVENT_DETAIL_SELECT` (`_EVENT_SELECT` plus `body`,
+  `recurrence`, `webLink` — this one's a single-item fetch like
+  `read_message`, so the extra detail is worth it).
+
+`list_messages` and `search_emails` were already correctly trimmed via
+`_MESSAGE_SELECT` (added in 0.12) — no change needed there.
+
 ## 2026-09-13
 
 ### 0.12 — Add list_messages (folder-scoped message listing)
