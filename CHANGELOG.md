@@ -9,6 +9,16 @@ tracked in git commit history only, not here.
 
 ## 2026-10-03
 
+### 0.17 - Report the server version to clients
+
+Prompted by a client session still showing the 0.15 `create_rule` schema after the
+server had been upgraded to 0.16, with no way to see which version was running.
+
+**Added**
+- `get_profile` now also returns `serverVersion`. It is an existing tool, so it
+  works even when a client's cached tool list predates this release.
+- `get_version` tool returning `{"version": ...}`.
+
 ### 0.16 - Rule tools: category action and word-match conditions
 
 Prompted by converting two Outlook rules that categorize mail by sender and by
