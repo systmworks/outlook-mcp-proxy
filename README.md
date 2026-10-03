@@ -168,6 +168,20 @@ Where this diverges from the [Gmail sibling project](https://github.com/systmwor
 - Graph explicitly documents and honors `Retry-After` - a more reliable throttling signal than Gmail's docs provide.
 - Calendar write, free/busy, `findMeetingTimes`, and a full Contacts API are all natively easy on Graph - deliberately deferred here, not technical gaps.
 
+## After a connector update
+
+Claude keeps the tool list it loaded in each chat's history, so a chat can keep showing an
+older tool set after you upgrade the server. "Reconnect" does not refresh it. To get the
+new tools into an existing chat:
+
+1. Delete and re-add the connector in Claude.
+2. Restart the Claude app if it still shows the old tools.
+3. In the chat, run `/compact` - this reloads the tool definitions from the server.
+4. Only start a new chat if that still doesn't fix it.
+
+To check, call `get_version` in the chat and compare it with the newest
+[Changelog](CHANGELOG.md) entry.
+
 ## Notes
 
 - The running version is logged at startup (`journalctl -u outlook-mcp-proxy | grep starting`)
