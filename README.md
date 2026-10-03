@@ -62,7 +62,7 @@ different Microsoft account.
 | `mark_as_junk` | Move a message to Junk Email |
 | `trash_message` | Move a message to Deleted Items |
 | `list_rules` | Server-side inbox rules (see [Server-side rules](#server-side-rules)) |
-| `create_rule` | Create a server-side rule by exact sender address (`delete` / `move` / `mark_read_only`; does not mark read unless asked) |
+| `create_rule` | Create a server-side rule by sender / recipient (`delete` / `move` / `mark_read_only` / `categorize`; does not mark read unless asked) |
 | `delete_rule` | Delete a server-side rule |
 | `list_calendars` | All calendars |
 | `list_events` | Events in a time window (defaults to now-+30 days) |
@@ -121,8 +121,13 @@ separate action you opt into) - unlike moving messages from a client.
   scopes. An account connected before these tools existed must be removed and re-added in
   Claude so the Microsoft consent screen grants them; a 403 mentioning `MailboxSettings`
   means that consent is missing.
-- `create_rule` matches **exact** sender addresses, only for the Inbox, refuses a
-  `display_name` that is already used, and `move` needs a real folder id from `list_folders`.
+- `create_rule` works on the Inbox only and refuses a `display_name` that is already used.
+  Conditions (at least one): `sender_addresses` (exact), `sender_contains` and
+  `recipient_contains` (word match on the sender / To-Cc address, like Outlook's "sender
+  address" and "recipient address" conditions). Actions: `delete`, `move` (needs a real
+  folder id from `list_folders`), `mark_read_only` or `categorize`, and `assign_categories`
+  can be added to any of them. Rules stop later rules by default; pass
+  `stop_processing=false` for a rule (e.g. a categorize-only one) that should let the rest run.
 - `list_rules` also shows `exceptions` and `hasError`. There is no edit tool - delete and
   re-create.
 

@@ -789,3 +789,25 @@ async def test_create_rule_mark_read_only_and_first_sequence():
 async def test_delete_rule():
     respx.delete(f"{_RULES_URL}/r1").mock(return_value=httpx.Response(204))
     assert await server.delete_rule("r1") == {"deleted": "r1"}
+
+
+@respx.mock
+async def test_create_rule_categorize_with_word_conditions_and_no_stop():
+    import json
+    respx.get(_RULES_URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    route = respx.post(_RULES_URL).mock(return_value=httpx.Response(201, json={"id": "r1"}))
+    await server.create_rule("Cat", [], "categorize", stop_processing=False,
+                             sender_contains=["boss@example.com"],
+                             recipient_contains=["boss@example.com"],
+                             assign_categories=["From Boss"])
+    body = json.loads(route.calls.last.request.content)
+    assert body["conditions"] == {"senderContains": ["boss@example.com"],
+                                  "recipientContains": ["boss@example.com"]}
+    assert body["actions"] == {"stopProcessingRules": False, "assignCategories": ["From Boss"]}
+
+
+async def test_create_rule_categorize_requires_categories_and_a_condition():
+    with pytest.raises(ValueError, match="assign_categories"):
+        await server.create_rule("C", ["a@example.com"], "categorize")
+    with pytest.raises(ValueError, match="at least one condition"):
+        await server.create_rule("C", [], "categorize", assign_categories=["X"])

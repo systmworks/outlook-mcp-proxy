@@ -40,7 +40,7 @@ log = logging.getLogger("outlook_mcp")
 
 # Keep in step with the newest CHANGELOG.md entry. Logged at startup and reported to
 # MCP clients, so a deployed container's version can be confirmed.
-VERSION = "0.15"
+VERSION = "0.16"
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -885,30 +885,54 @@ async def list_rules() -> list[dict]:
 @mcp.tool
 async def create_rule(display_name: str, sender_addresses: list[str], action: str,
                       destination_folder_id: str = "", mark_as_read: bool = False,
-                      stop_processing: bool = True, sequence: int | None = None) -> dict:
-    """Create a server-side inbox rule matching mail from any of sender_addresses
-    (exact addresses). action: 'delete' (move to Deleted Items), 'move' (needs
-    destination_folder_id, a real folder id from list_folders) or
-    'mark_read_only'. Messages are only marked read if mark_as_read is true (or
-    action is 'mark_read_only'). sequence sets run order; by default the rule
-    goes after all existing ones. Rejects a display_name already used by another
-    rule, so a repeated call can't create duplicates."""
+                      stop_processing: bool = True, sequence: int | None = None,
+                      sender_contains: list[str] | None = None,
+                      recipient_contains: list[str] | None = None,
+                      assign_categories: list[str] | None = None) -> dict:
+    """Create a server-side inbox rule. Conditions (at least one is required; all
+    that are given must match): sender_addresses = mail from any of these exact
+    addresses (pass [] to skip); sender_contains = the sender's address contains
+    any of these words (Outlook's "sender address" condition); recipient_contains
+    = the To/Cc recipients' addresses contain any of these words (Outlook's
+    "recipient address" condition).
+    action: 'delete' (move to Deleted Items), 'move' (needs destination_folder_id,
+    a real folder id from list_folders), 'mark_read_only', or 'categorize' (needs
+    assign_categories). assign_categories (category names) can also be combined
+    with the other actions. Messages are only marked read if mark_as_read is true
+    (or action is 'mark_read_only'). stop_processing defaults to true - pass false
+    for a rule that should not prevent later rules from running (e.g. a
+    categorize-only rule). sequence sets run order; by default the rule goes after
+    all existing ones. Rejects a display_name already used by another rule, so a
+    repeated call can't create duplicates."""
     _require_write()
-    if action not in ("delete", "move", "mark_read_only"):
-        raise ValueError("action must be 'delete', 'move' or 'mark_read_only'")
+    if action not in ("delete", "move", "mark_read_only", "categorize"):
+        raise ValueError("action must be 'delete', 'move', 'mark_read_only' or 'categorize'")
     if action == "move" and not destination_folder_id:
         raise ValueError("destination_folder_id is required when action is 'move'")
+    categories = [c.strip() for c in (assign_categories or []) if c.strip()]
+    if action == "categorize" and not categories:
+        raise ValueError("assign_categories is required when action is 'categorize'")
     addresses = [a.strip() for a in sender_addresses]
-    if not addresses:
-        raise ValueError("sender_addresses must not be empty")
     for a in addresses:
         if not _EMAIL_RE.fullmatch(a):
             raise ValueError(f"not a valid email address: {a!r}")
+    conditions: dict = {}
+    if addresses:
+        conditions["fromAddresses"] = [{"emailAddress": {"address": a}} for a in addresses]
+    for key, words in (("senderContains", sender_contains), ("recipientContains", recipient_contains)):
+        cleaned = [w.strip() for w in (words or []) if w.strip()]
+        if cleaned:
+            conditions[key] = cleaned
+    if not conditions:
+        raise ValueError("give at least one condition: sender_addresses, sender_contains "
+                         "or recipient_contains")
     actions: dict = {"stopProcessingRules": stop_processing}
     if action == "delete":
         actions["delete"] = True
     elif action == "move":
         actions["moveToFolder"] = destination_folder_id
+    if categories:
+        actions["assignCategories"] = categories
     if mark_as_read or action == "mark_read_only":
         actions["markAsRead"] = True
     existing = await _call_list("GET", _RULES)
@@ -920,7 +944,7 @@ async def create_rule(display_name: str, sender_addresses: list[str], action: st
         "displayName": display_name,
         "sequence": sequence,
         "isEnabled": True,
-        "conditions": {"fromAddresses": [{"emailAddress": {"address": a}} for a in addresses]},
+        "conditions": conditions,
         "actions": actions,
     }
     r = await _call("POST", _RULES, json=body)
