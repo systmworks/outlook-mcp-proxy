@@ -7,6 +7,21 @@ version order, starting at 0.1. Administrative changes (documentation, README/SE
 CI/tooling config, LICENSE, dependency pins, changelog maintenance itself, etc.) are
 tracked in git commit history only, not here.
 
+## 2026-10-03
+
+### 0.14 — Server-side inbox rules
+
+Graph's `mailFolders/inbox/messageRules` runs rules in Exchange on arrival, so a
+sender rule with a delete/move action leaves messages unread (marking read is a
+separate opt-in action), unlike client-side moves.
+
+**Added**
+- `list_rules`, `create_rule`, `delete_rule` tools. `create_rule` matches on
+  `fromAddresses`, supports `delete`, `move` and `mark_read_only` actions, and
+  only sets `markAsRead` when asked. Sequence defaults to after existing rules.
+- New scopes `MailboxSettings.Read` (base) and `MailboxSettings.ReadWrite`
+  (write). Existing connections must reconnect to grant them.
+
 ## 2026-09-14
 
 ### 0.13 — Stop returning full message bodies from write/action tool results
