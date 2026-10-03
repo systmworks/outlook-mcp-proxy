@@ -38,7 +38,8 @@ different Microsoft account.
 
 | Tool | Description |
 |------|-------------|
-| `get_profile` | Outlook account profile |
+| `get_profile` | Outlook account profile, plus `serverVersion` (the running proxy version) |
+| `get_version` | The running proxy version - compare with the [Changelog](CHANGELOG.md) to spot a stale cached tool list |
 | `search_emails` | Search with Graph's `$search` syntax (`from:`, `subject:`, `body:`, `received:`, …) |
 | `list_messages` | Messages inside one specific folder (id or well-known name like `"inbox"`), newest first; `search_emails` can't be scoped to a folder |
 | `read_message` | Full message with decoded body and attachment metadata |

@@ -94,6 +94,11 @@ async def test_get_profile_returns_graph_response():
     }))
     result = await server.get_profile()
     assert result["mail"] == "a@example.com"
+    assert result["serverVersion"] == server.VERSION
+
+
+async def test_get_version_reports_server_version():
+    assert await server.get_version() == {"version": server.VERSION}
 
 
 @respx.mock

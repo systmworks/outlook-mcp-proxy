@@ -40,7 +40,7 @@ log = logging.getLogger("outlook_mcp")
 
 # Keep in step with the newest CHANGELOG.md entry. Logged at startup and reported to
 # MCP clients, so a deployed container's version can be confirmed.
-VERSION = "0.16"
+VERSION = "0.17"
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -523,9 +523,20 @@ mcp = FastMCP("Outlook MCP", version=VERSION)
 
 @mcp.tool
 async def get_profile() -> dict:
-    """Get the authenticated Outlook account's profile."""
+    """Get the authenticated Outlook account's profile, plus serverVersion (the
+    running proxy's version) so a client can tell whether its cached tool list is
+    out of date after an upgrade."""
     r = await _call("GET", ME, params={"$select": "id,displayName,mail,userPrincipalName"})
-    return r.json()
+    return {**r.json(), "serverVersion": VERSION}
+
+
+@mcp.tool
+async def get_version() -> dict:
+    """Report the running proxy's version (same value as get_profile's
+    serverVersion and the startup log line). If it is newer than what a tool's
+    description or parameters suggest, the client's cached tool list is stale -
+    remove and re-add the connector."""
+    return {"version": VERSION}
 
 
 _MESSAGE_SELECT = ("id,conversationId,subject,from,toRecipients,receivedDateTime,"
