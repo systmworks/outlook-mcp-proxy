@@ -9,6 +9,19 @@ tracked in git commit history only, not here.
 
 ## 2026-10-03
 
+### 0.16 - Rule tools: category action and word-match conditions
+
+Prompted by converting two Outlook rules that categorize mail by sender and by
+recipient address, which `create_rule` could not express.
+
+**Added**
+- `create_rule` conditions `sender_contains` (Graph `senderContains`) and
+  `recipient_contains` (Graph `recipientContains`), matching Outlook's "sender
+  address" and "recipient address" word conditions. `sender_addresses` may now be
+  `[]` as long as one condition is given.
+- `create_rule` action `categorize` and an `assign_categories` option (usable
+  with any action), sent to Graph as `assignCategories`.
+
 ### 0.15 - Review pass: reliability, safer retries, rule-tool hardening
 
 **Fixed**
