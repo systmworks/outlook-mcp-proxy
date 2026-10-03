@@ -60,6 +60,9 @@ different Microsoft account.
 | `move_message` | Move a message to another folder |
 | `mark_as_junk` | Move a message to Junk Email |
 | `trash_message` | Move a message to Deleted Items |
+| `list_rules` | Server-side inbox rules |
+| `create_rule` | Create a server-side rule by sender (delete / move; does not mark read unless asked) |
+| `delete_rule` | Delete a server-side rule |
 | `list_calendars` | All calendars |
 | `list_events` | Events in a time window (defaults to now–+30 days) |
 | `search_events` | Search events by keyword |

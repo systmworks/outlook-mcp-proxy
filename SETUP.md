@@ -28,7 +28,7 @@ registrations**. You do not need a paid Azure subscription — app registration 
    update the running server.
 4. No API permissions need to be added manually here — the scopes
    (`Mail.Read`, `Mail.ReadWrite`, `Mail.Send`, `Calendars.Read`, `Calendars.ReadWrite`,
-   `User.Read`, `offline_access`) are requested dynamically per-connection at sign-in
+   `MailboxSettings.Read`, `MailboxSettings.ReadWrite`, `User.Read`, `offline_access`) are requested dynamically per-connection at sign-in
    time and Microsoft's consent screen handles the grant.
 
 ## 2. Deploy the server

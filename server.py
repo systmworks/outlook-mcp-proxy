@@ -97,11 +97,13 @@ MS_SCOPES_BASE = [
     "User.Read",
     "Mail.Read",
     "Calendars.Read",
+    "MailboxSettings.Read",
 ]
 MS_SCOPES_WRITE = [
     "Mail.ReadWrite",
     "Mail.Send",
     "Calendars.ReadWrite",
+    "MailboxSettings.ReadWrite",
 ]
 
 
@@ -436,6 +438,10 @@ def _move_summary(data: dict) -> dict:
     always returns the complete moved message (full body). Only the new id and
     destination are ever useful from that response."""
     return {"id": data["id"], "parentFolderId": data.get("parentFolderId", "")}
+
+
+def _rule_summary(data: dict) -> dict:
+    return {k: data.get(k) for k in ("id", "displayName", "sequence", "isEnabled", "conditions", "actions")}
 
 
 def _calendar_base(calendar_id: str) -> str:
@@ -791,6 +797,62 @@ async def move_folder(folder_id: str, destination_folder_id: str) -> dict:
     r = await _call("POST", f"{ME}/mailFolders/{_enc(folder_id)}/move",
                     json={"destinationId": destination_folder_id})
     return r.json()
+
+
+_RULES = f"{ME}/mailFolders/inbox/messageRules"
+
+
+@mcp.tool
+async def list_rules() -> list[dict]:
+    """List the server-side inbox rules (they run in Exchange on arrival, so
+    unlike client-side moves they don't mark messages as read unless the rule
+    says so)."""
+    return [_rule_summary(x) for x in await _call_list("GET", _RULES)]
+
+
+@mcp.tool
+async def create_rule(display_name: str, sender_addresses: list[str], action: str,
+                      destination_folder_id: str = "", mark_as_read: bool = False,
+                      stop_processing: bool = True, sequence: int | None = None) -> dict:
+    """Create a server-side inbox rule matching mail from any of sender_addresses.
+    action: 'delete' (move to Deleted Items), 'move' (needs destination_folder_id;
+    folder id or well-known name) or 'mark_read_only'. Messages are only marked
+    read if mark_as_read is true (or action is 'mark_read_only'). sequence sets
+    run order; by default the rule goes after all existing ones."""
+    _require_write()
+    if action not in ("delete", "move", "mark_read_only"):
+        raise ValueError("action must be 'delete', 'move' or 'mark_read_only'")
+    if action == "move" and not destination_folder_id:
+        raise ValueError("destination_folder_id is required when action is 'move'")
+    if not sender_addresses:
+        raise ValueError("sender_addresses must not be empty")
+    actions: dict = {"stopProcessingRules": stop_processing}
+    if action == "delete":
+        actions["delete"] = True
+    elif action == "move":
+        actions["moveToFolder"] = destination_folder_id
+    if mark_as_read or action == "mark_read_only":
+        actions["markAsRead"] = True
+    if sequence is None:
+        existing = await _call_list("GET", _RULES)
+        sequence = max((x.get("sequence") or 0 for x in existing), default=0) + 1
+    body = {
+        "displayName": display_name,
+        "sequence": sequence,
+        "isEnabled": True,
+        "conditions": {"fromAddresses": [{"emailAddress": {"address": a}} for a in sender_addresses]},
+        "actions": actions,
+    }
+    r = await _call("POST", _RULES, json=body)
+    return _rule_summary(r.json())
+
+
+@mcp.tool
+async def delete_rule(rule_id: str) -> dict:
+    """Delete a server-side inbox rule by id (from list_rules)."""
+    _require_write()
+    await _call("DELETE", f"{_RULES}/{_enc(rule_id)}")
+    return {"deleted": rule_id}
 
 
 @mcp.tool

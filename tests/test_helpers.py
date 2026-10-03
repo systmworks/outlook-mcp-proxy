@@ -46,7 +46,9 @@ def test_ms_scopes_read_only_excludes_write_scopes():
     assert "Mail.ReadWrite" not in scopes
     assert "Mail.Send" not in scopes
     assert "Calendars.ReadWrite" not in scopes
+    assert "MailboxSettings.ReadWrite" not in scopes
     assert "Mail.Read" in scopes
+    assert "MailboxSettings.Read" in scopes
 
 
 def test_ms_scopes_read_write_includes_write_scopes():
@@ -54,6 +56,7 @@ def test_ms_scopes_read_write_includes_write_scopes():
     assert "Mail.ReadWrite" in scopes
     assert "Mail.Send" in scopes
     assert "Calendars.ReadWrite" in scopes
+    assert "MailboxSettings.ReadWrite" in scopes
 
 
 def test_ms_scopes_always_requests_offline_access():

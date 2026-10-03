@@ -271,6 +271,8 @@ _WRITE_TOOL_CALLS = [
     ("move_message", ("m1", "archive")),
     ("mark_as_junk", ("m1",)),
     ("trash_message", ("m1",)),
+    ("create_rule", ("Rule", ["a@example.com"], "delete")),
+    ("delete_rule", ("r1",)),
 ]
 
 
@@ -642,3 +644,59 @@ async def test_send_email_reply_uses_native_reply_action():
     import json
     body = json.loads(route.calls.last.request.content)
     assert body["comment"] == "my reply"
+
+
+# -- server-side rules ---------------------------------------------------------
+
+_RULES_URL = f"{server.ME}/mailFolders/inbox/messageRules"
+
+
+@respx.mock
+async def test_list_rules_trims_fields():
+    respx.get(_RULES_URL).mock(return_value=httpx.Response(200, json={"value": [
+        {"id": "r1", "displayName": "R", "sequence": 1, "isEnabled": True,
+         "conditions": {}, "actions": {}, "hasError": False}]}))
+    rules = await server.list_rules()
+    assert rules == [{"id": "r1", "displayName": "R", "sequence": 1, "isEnabled": True,
+                      "conditions": {}, "actions": {}}]
+
+
+@respx.mock
+async def test_create_rule_delete_does_not_mark_read_by_default():
+    import json
+    respx.get(_RULES_URL).mock(return_value=httpx.Response(
+        200, json={"value": [{"id": "r0", "sequence": 3}]}))
+    route = respx.post(_RULES_URL).mock(return_value=httpx.Response(201, json={
+        "id": "r1", "displayName": "Block", "sequence": 4, "isEnabled": True,
+        "conditions": {}, "actions": {}}))
+    result = await server.create_rule("Block", ["a@example.com"], "delete")
+    body = json.loads(route.calls.last.request.content)
+    assert body["sequence"] == 4
+    assert body["conditions"]["fromAddresses"] == [{"emailAddress": {"address": "a@example.com"}}]
+    assert body["actions"] == {"stopProcessingRules": True, "delete": True}
+    assert result["id"] == "r1"
+
+
+@respx.mock
+async def test_create_rule_move_with_mark_read():
+    import json
+    route = respx.post(_RULES_URL).mock(return_value=httpx.Response(201, json={"id": "r1"}))
+    await server.create_rule("M", ["a@example.com"], "move", destination_folder_id="f1",
+                             mark_as_read=True, sequence=2)
+    body = json.loads(route.calls.last.request.content)
+    assert body["actions"] == {"stopProcessingRules": True, "moveToFolder": "f1", "markAsRead": True}
+
+
+async def test_create_rule_validates_arguments():
+    with pytest.raises(ValueError):
+        await server.create_rule("M", ["a@example.com"], "move")
+    with pytest.raises(ValueError):
+        await server.create_rule("M", ["a@example.com"], "bogus")
+    with pytest.raises(ValueError):
+        await server.create_rule("M", [], "delete")
+
+
+@respx.mock
+async def test_delete_rule():
+    respx.delete(f"{_RULES_URL}/r1").mock(return_value=httpx.Response(204))
+    assert await server.delete_rule("r1") == {"deleted": "r1"}
