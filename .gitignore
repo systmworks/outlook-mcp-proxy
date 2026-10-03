@@ -8,8 +8,10 @@ __pycache__/
 .venv*/
 DEPLOYMENT.md
 SESSION_HANDOVER.md
-COMMITTEE_MAILBOX_CLEANUP_RULES.md
 
 # Local mailbox dumps (personal data)
 inbox_tree.json
 inbox_tree_readable.txt
+
+# Mailbox cleanup working files (committee data)
+mailbox-cleanup/
