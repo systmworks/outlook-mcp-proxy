@@ -60,7 +60,7 @@ def test_ms_scopes_read_write_includes_write_scopes():
 
 
 def test_ms_scopes_always_requests_offline_access():
-    # Required to get a refresh token at all on the Microsoft identity platform —
+    # Required to get a refresh token at all on the Microsoft identity platform -
     # unlike Google, which grants one by default on first consent.
     assert "offline_access" in server._ms_scopes(read_only=True).split()
     assert "offline_access" in server._ms_scopes(read_only=False).split()
@@ -146,8 +146,8 @@ def test_enc_passes_through_safe_characters():
 
 
 def test_enc_percent_encodes_reserved_path_characters():
-    # Graph message ids are documented to sometimes contain '/' — a reserved
-    # path delimiter — which must be encoded or it splits the request path.
+    # Graph message ids are documented to sometimes contain '/' - a reserved
+    # path delimiter - which must be encoded or it splits the request path.
     assert server._enc("m1/weird") == "m1%2Fweird"
     assert server._enc("a?b") == "a%3Fb"
 
@@ -206,7 +206,7 @@ def test_normalize_path_leaves_canonical_path_untouched():
 def test_parse_read_only_aliases_ignores_slash_only_token():
     # Regression test: the old filter-before-strip implementation let a
     # slash-only token (e.g. a stray "/") collapse to "" and get inserted into
-    # the set — "" also being the alias of the unaliased connector, which would
+    # the set - "" also being the alias of the unaliased connector, which would
     # then be silently forced into read-only mode.
     aliases = server._parse_read_only_aliases("work,/")
     assert aliases == frozenset({"work"})
@@ -237,7 +237,7 @@ def test_parse_retry_after_accepts_delay_seconds():
 @pytest.mark.asyncio
 async def test_request_with_retry_does_not_retry_network_errors(monkeypatch):
     # Regression test: a network-level error (timeout, connection reset) leaves
-    # it ambiguous whether the request already landed server-side — blindly
+    # it ambiguous whether the request already landed server-side - blindly
     # retrying a non-idempotent write could duplicate it, so these must not be
     # retried, unlike a definite retryable HTTP status.
     async def raising_request(*args, **kwargs):
@@ -305,3 +305,19 @@ async def test_request_with_retry_honors_retry_after_header(monkeypatch):
     finally:
         await server._http_client.aclose()
         server._http_client = None
+
+
+def test_should_retry_policy():
+    assert server._should_retry("POST", 429, False)
+    assert server._should_retry("GET", 503, False)
+    assert server._should_retry("DELETE", 500, False)
+    assert not server._should_retry("POST", 503, False)
+    assert server._should_retry("POST", 503, True)
+    assert not server._should_retry("GET", 404, False)
+
+
+def test_changelog_top_entry_matches_server_version():
+    import pathlib
+    text = (pathlib.Path(__file__).parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    first_entry = next(line for line in text.splitlines() if line.startswith("### "))
+    assert first_entry.startswith(f"### {server.VERSION} ")

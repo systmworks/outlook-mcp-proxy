@@ -12,7 +12,7 @@ select = [
     "F",    # pyflakes
     "W",    # pycodestyle warnings
     "I",    # import sorting
-    "B",    # bugbear — likely bugs
+    "B",    # bugbear - likely bugs
     "UP",   # pyupgrade
     "RUF",  # ruff-specific
     "PLW",  # pylint warnings

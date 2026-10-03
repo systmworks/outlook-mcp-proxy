@@ -5,37 +5,39 @@
 ## 1. Register the Azure app
 
 All of this happens in the [Azure Portal](https://portal.azure.com) → **App
-registrations**. You do not need a paid Azure subscription — app registration is free.
+registrations**. You do not need a paid Azure subscription - app registration is free.
 
 1. **App registrations → New registration**.
    - Name: anything, e.g. `Outlook MCP Proxy`.
    - **Supported account types: "Personal Microsoft accounts only."** This is the
-     single most important setting on this page — it's what restricts sign-in to
+     single most important setting on this page - it's what restricts sign-in to
      personal outlook.com/hotmail.com/live.com accounts and structurally excludes
      work/school accounts. Do not pick "Accounts in any organizational directory and
-     personal Microsoft accounts" — that would let work/school accounts through too.
+     personal Microsoft accounts" - that would let work/school accounts through too.
    - Redirect URI: platform **Web**, value `https://<your-domain>/auth/callback`
-     (fill in your real domain once you know it — see step 2; you can come back and
+     (fill in your real domain once you know it - see step 2; you can come back and
      edit this later under **Authentication** if you don't have it yet).
    - Click **Register**.
-2. Note the **Application (client) ID** shown on the app's Overview page — this is
+2. Note the **Application (client) ID** shown on the app's Overview page - this is
    `MS_CLIENT_ID`.
 3. **Certificates & secrets → New client secret**. Give it a description and the
-   longest expiry Azure offers (max 24 months — **there is no "never expires" option**,
-   unlike Google). Copy the secret **value** immediately; Azure only shows it once —
-   this is `MS_CLIENT_SECRET`. **Set a reminder for before the expiry date** — an
+   longest expiry Azure offers (max 24 months - **there is no "never expires" option**,
+   unlike Google). Copy the secret **value** immediately; Azure only shows it once -
+   this is `MS_CLIENT_SECRET`. **Set a reminder for before the expiry date** - an
    expired secret breaks every connected session until you generate a new one and
    update the running server.
-4. No API permissions need to be added manually here — the scopes
+4. No API permissions need to be added manually here - the scopes
    (`Mail.Read`, `Mail.ReadWrite`, `Mail.Send`, `Calendars.Read`, `Calendars.ReadWrite`,
-   `MailboxSettings.Read`, `MailboxSettings.ReadWrite`, `User.Read`, `offline_access`) are requested dynamically per-connection at sign-in
-   time and Microsoft's consent screen handles the grant.
+   `MailboxSettings.Read`, `MailboxSettings.ReadWrite`, `User.Read`, `offline_access`)
+   are requested dynamically per-connection at sign-in time and Microsoft's consent
+   screen handles the grant. If a release adds a scope, an already-connected account
+   must be removed and re-added in Claude to grant it.
 
 ## 2. Deploy the server
 
 This is written for a Proxmox LXC container reachable over
 [Tailscale](https://tailscale.com), which is what avoids opening any public port. Any
-host with HTTPS works the same way — substitute your own reverse proxy/TLS setup.
+host with HTTPS works the same way - substitute your own reverse proxy/TLS setup.
 
 1. Create a new LXC container (Debian/Ubuntu template) with Python 3.12+ available
    (`apt install python3.12-venv` if it isn't already).
@@ -52,7 +54,7 @@ host with HTTPS works the same way — substitute your own reverse proxy/TLS set
    curl -fsSL https://tailscale.com/install.sh | sh
    tailscale up
    ```
-   Note the `*.ts.net` MagicDNS hostname it's assigned — this becomes `BASE_URL`.
+   Note the `*.ts.net` MagicDNS hostname it's assigned - this becomes `BASE_URL`.
 4. Create `/opt/outlook-mcp-proxy/.env`:
    ```bash
    MS_CLIENT_ID=<from step 1.2>
@@ -60,8 +62,15 @@ host with HTTPS works the same way — substitute your own reverse proxy/TLS set
    JWT_SECRET=<openssl rand -hex 32>
    BASE_URL=https://<your-tailscale-hostname>
    ```
+   Lock it down, and create the unprivileged user the service unit below runs as
+   (without it the service fails to start with `status=217/USER`):
+   ```bash
+   chmod 600 /opt/outlook-mcp-proxy/.env
+   useradd --system --no-create-home --shell /usr/sbin/nologin outlook-mcp
+   ```
+   systemd reads `.env` as root, so the service user doesn't need access to it.
 5. Go back to **Azure Portal → your app → Authentication** and set the redirect URI to
-   exactly `https://<your-tailscale-hostname>/auth/callback` — it must match `BASE_URL`
+   exactly `https://<your-tailscale-hostname>/auth/callback` - it must match `BASE_URL`
    byte-for-byte.
 6. Create a systemd unit, e.g. `/etc/systemd/system/outlook-mcp-proxy.service`:
    ```ini
@@ -85,14 +94,14 @@ host with HTTPS works the same way — substitute your own reverse proxy/TLS set
    systemctl enable --now outlook-mcp-proxy
    ```
 7. **Enable Tailscale Funnel.** `tailscale up` (step 3) only makes the server reachable
-   *within your own tailnet* — Claude's servers aren't part of it, so plain Tailscale
+   *within your own tailnet* - Claude's servers aren't part of it, so plain Tailscale
    visibility isn't enough. Funnel is what makes it genuinely public over HTTPS via
    Tailscale's relay:
    ```bash
    tailscale funnel 8000
    ```
    On some Tailscale versions this doesn't persist once the foreground process exits
-   (`tailscale funnel status` reports "No serve config" after Ctrl-C) — if that happens,
+   (`tailscale funnel status` reports "No serve config" after Ctrl-C) - if that happens,
    keep it running via its own systemd unit instead, e.g.
    `/etc/systemd/system/tailscale-funnel.service`:
    ```ini
@@ -115,14 +124,19 @@ host with HTTPS works the same way — substitute your own reverse proxy/TLS set
    ```
    Note: under some Tailscale versions run non-interactively (e.g. via systemd),
    `tailscale funnel status` may still report "No serve config" even when Funnel is
-   genuinely working — trust the curl test in the next step over that status output.
+   genuinely working - trust the curl test in the next step over that status output.
 8. Verify it's up:
    ```bash
    curl https://<your-tailscale-hostname>/.well-known/oauth-authorization-server
    ```
    This should return a small JSON document, not an error page.
 
-**Never run multiple replicas or `uvicorn --workers N`** — session/state stores are
+   Note that Funnel makes the OAuth endpoints (`/authorize`, `/token`, the
+   `.well-known` metadata) reachable from the public internet. That is required for
+   Claude to connect and is bounded by PKCE, the redirect allowlist and a cap on
+   pending sign-ins; `/mcp` itself needs a valid bearer token.
+
+**Never run multiple replicas or `uvicorn --workers N`** - session/state stores are
 per-process in-memory; a request landing on a different process than the one that
 authenticated it fails as if unauthenticated.
 
@@ -145,14 +159,14 @@ Expand **Advanced settings** and fill in:
 That last part isn't optional in practice: this server doesn't implement automatic
 client registration (it's a single-user proxy, not a multi-tenant OAuth provider), so
 without something in the Client ID field, Claude will show a "client registration isn't
-supported" warning and refuse to connect. The value itself doesn't matter — the server
+supported" warning and refuse to connect. The value itself doesn't matter - the server
 never checks it, it only needs to be non-empty.
 
 Click **Add**, then **Connect**, and sign in with your personal Microsoft account. You
 should land back in Claude successfully authenticated.
 
-**Second account:** repeat this whole step with a different alias in the URL —
-`https://<your-tailscale-hostname>/family/mcp` — and sign in with the second account.
+**Second account:** repeat this whole step with a different alias in the URL -
+`https://<your-tailscale-hostname>/family/mcp` - and sign in with the second account.
 Any alias name works for either connector; `/personal/` and `/family/` are just
 examples. Both connectors share the same deployed server and the same Azure app.
 
@@ -166,13 +180,19 @@ pip install -r requirements.txt
 systemctl restart outlook-mcp-proxy
 ```
 
+Confirm the new version is the one running (it logs `Outlook MCP proxy vX.Y starting`;
+compare with the newest [Changelog](CHANGELOG.md) entry):
+```bash
+journalctl -u outlook-mcp-proxy -n 20 --no-pager | grep starting
+```
+
 Tail live logs to confirm it's serving correctly after the restart:
 ```bash
 journalctl -u outlook-mcp-proxy -f
 ```
 `Ctrl-C` to stop following; it doesn't stop the service.
 
-Every restart wipes the in-memory session store — after restarting, any connected
+Every restart wipes the in-memory session store - after restarting, any connected
 account needs to be removed and re-added in Claude, then signed in again.
 
 ## Self-hosting without Tailscale
@@ -192,5 +212,5 @@ docker run -d --env-file .env -p 8000:8000 outlook-mcp
 ```
 
 Set `BASE_URL` to whatever public URL your proxy exposes the server under (a bare
-domain, or a domain plus path prefix if sharing a host with other services) — the
+domain, or a domain plus path prefix if sharing a host with other services) - the
 server builds its OAuth redirect URIs from it, so it must match exactly.

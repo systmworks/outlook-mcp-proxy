@@ -195,7 +195,7 @@ async def test_search_emails_escapes_embedded_quote_in_query():
 @respx.mock
 async def test_read_message_url_encodes_message_id_containing_slash():
     # Regression test: Graph message ids are documented to sometimes contain
-    # '/' — a reserved path delimiter — which must be percent-encoded or it
+    # '/' - a reserved path delimiter - which must be percent-encoded or it
     # splits the request onto an unintended path.
     route = respx.get(url__regex=r".*/messages/.*").mock(return_value=httpx.Response(200, json={
         "id": "m1/weird", "conversationId": "", "from": None, "toRecipients": [],
@@ -226,7 +226,7 @@ async def test_get_attachment_checks_declared_size_before_downloading():
 @respx.mock
 async def test_get_attachment_reuses_id_across_calls_no_gmail_style_mismatch():
     # Unlike Gmail's attachmentId (which can differ across separate messages.get
-    # calls for the same attachment), Graph attachment ids are stable — the same
+    # calls for the same attachment), Graph attachment ids are stable - the same
     # id returned by an earlier read_message/list call can always be reused here.
     import base64
     content = base64.b64encode(b"hello world").decode()
@@ -245,7 +245,7 @@ async def test_get_attachment_reuses_id_across_calls_no_gmail_style_mismatch():
 @respx.mock
 async def test_get_attachment_rejects_missing_content_bytes():
     # Regression test: a referenceAttachment (e.g. a OneDrive link) or certain
-    # itemAttachment types carry no contentBytes — treating that as a valid
+    # itemAttachment types carry no contentBytes - treating that as a valid
     # empty download would silently hand back a 0-byte "success" instead of a
     # clear error that this attachment type isn't downloadable this way.
     respx.get(f"{server.ME}/messages/m1/attachments/a1").mock(return_value=httpx.Response(
@@ -291,7 +291,7 @@ async def test_list_folders_defaults_to_top_level_only():
     respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
         "value": [{"id": "top", "displayName": "Top", "childFolderCount": 1}],
     }))
-    # No mock registered for .../top/childFolders — if list_folders() walked
+    # No mock registered for .../top/childFolders - if list_folders() walked
     # into it by default, respx would raise for the unmocked request.
     folders = await server.list_folders()
     assert [f["id"] for f in folders] == ["top"]
@@ -414,7 +414,7 @@ async def test_count_folders_requests_minimal_select():
 
 @respx.mock
 async def test_count_folders_scopes_to_parent_folder_id():
-    # No mock registered for the root /mailFolders — if count_folders ever
+    # No mock registered for the root /mailFolders - if count_folders ever
     # touched it instead of staying scoped to parent_folder_id, respx would
     # raise for the unmocked request.
     respx.get(f"{server.ME}/mailFolders/parent1/childFolders").mock(return_value=httpx.Response(200, json={
@@ -426,7 +426,7 @@ async def test_count_folders_scopes_to_parent_folder_id():
 
 @respx.mock
 async def test_count_folders_sets_truncated_at_depth_guard():
-    # A 7-deep chain (L0..L6, each with childFolderCount=1) — L6's own
+    # A 7-deep chain (L0..L6, each with childFolderCount=1) - L6's own
     # children (L7) are never mocked, proving the depth<6 guard stops the
     # walk before reaching them rather than silently fetching forever.
     respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(200, json={
@@ -458,7 +458,7 @@ async def test_update_categories_merges_add_and_remove():
 
 @respx.mock
 async def test_move_message_returns_new_message_id():
-    # Graph assigns a NEW id on move — unlike Gmail, where message ids never
+    # Graph assigns a NEW id on move - unlike Gmail, where message ids never
     # change when labels/location change.
     respx.post(f"{server.ME}/messages/m1/move").mock(return_value=httpx.Response(200, json={
         "id": "m1-new-id-after-move",
@@ -471,7 +471,7 @@ async def test_move_message_returns_new_message_id():
 @respx.mock
 async def test_move_message_strips_full_body_from_response():
     # Regression test: Graph's /move action ignores $select and always returns
-    # the complete moved message (full HTML body included) — the tool result
+    # the complete moved message (full HTML body included) - the tool result
     # must trim that down in Python instead of passing it straight through,
     # or the LLM context burns tokens on an email body it never asked to see.
     respx.post(f"{server.ME}/messages/m1/move").mock(return_value=httpx.Response(200, json={
@@ -625,14 +625,72 @@ async def test_list_events_non_primary_calendar_uses_calendar_id_path():
 # ── retry behavior ────────────────────────────────────────────────────────
 
 @respx.mock
-async def test_send_email_retries_transient_5xx_and_recovers():
+async def test_send_email_does_not_retry_5xx_because_the_send_may_have_landed():
     route = respx.post(f"{server.ME}/sendMail").mock(side_effect=[
         httpx.Response(503),
         httpx.Response(202),
     ])
-    result = await server.send_email("a@example.com", "Subj", "Body")
+    with pytest.raises(httpx.HTTPStatusError):
+        await server.send_email("a@example.com", "Subj", "Body")
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_send_email_retries_429_because_it_was_never_processed():
+    route = respx.post(f"{server.ME}/sendMail").mock(side_effect=[
+        httpx.Response(429, json={}),
+        httpx.Response(202),
+    ])
+    assert await server.send_email("a@example.com", "Subj", "Body") == {"sent": True}
     assert route.call_count == 2
-    assert result == {"sent": True}
+
+
+@respx.mock
+async def test_get_retries_transient_5xx_and_recovers():
+    route = respx.get(f"{server.ME}/mailFolders").mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={"value": []}),
+    ])
+    assert await server.list_folders() == []
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_graph_error_text_is_kept_in_the_raised_error():
+    respx.get(f"{server.ME}/mailFolders").mock(return_value=httpx.Response(403, json={
+        "error": {"code": "ErrorAccessDenied", "message": "Access is denied."}}))
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        await server.list_folders()
+    assert "ErrorAccessDenied" in str(exc.value)
+    assert "Access is denied." in str(exc.value)
+
+
+@respx.mock
+async def test_send_email_html_and_draft_html_flags():
+    import json
+    route = respx.post(f"{server.ME}/sendMail").mock(return_value=httpx.Response(202))
+    await server.send_email("a@example.com", "Subj", "<b>hi</b>", is_html=True)
+    assert json.loads(route.calls.last.request.content)["message"]["body"]["contentType"] == "HTML"
+    await server.send_email("a@example.com", "Subj", "hi")
+    assert json.loads(route.calls.last.request.content)["message"]["body"]["contentType"] == "Text"
+    draft = respx.post(f"{server.ME}/messages").mock(return_value=httpx.Response(201, json={"id": "d1"}))
+    await server.create_draft("a@example.com", "Subj", "<b>hi</b>", is_html=True)
+    assert json.loads(draft.calls.last.request.content)["body"]["contentType"] == "HTML"
+
+
+def test_clamp_top_bounds_values():
+    assert server._clamp_top(-5) == 1
+    assert server._clamp_top(0) == 1
+    assert server._clamp_top(20) == 20
+    assert server._clamp_top(10**9) == 1000
+
+
+@respx.mock
+async def test_list_messages_clamps_max_results():
+    route = respx.get(f"{server.ME}/mailFolders/inbox/messages").mock(
+        return_value=httpx.Response(200, json={"value": []}))
+    await server.list_messages("inbox", max_results=10**6)
+    assert route.calls.last.request.url.params["$top"] == "1000"
 
 
 @respx.mock
@@ -655,10 +713,17 @@ _RULES_URL = f"{server.ME}/mailFolders/inbox/messageRules"
 async def test_list_rules_trims_fields():
     respx.get(_RULES_URL).mock(return_value=httpx.Response(200, json={"value": [
         {"id": "r1", "displayName": "R", "sequence": 1, "isEnabled": True,
-         "conditions": {}, "actions": {}, "hasError": False}]}))
+         "conditions": {}, "actions": {}, "hasError": False, "isReadOnly": False}]}))
     rules = await server.list_rules()
     assert rules == [{"id": "r1", "displayName": "R", "sequence": 1, "isEnabled": True,
-                      "conditions": {}, "actions": {}}]
+                      "hasError": False, "conditions": {}, "exceptions": None, "actions": {}}]
+
+
+@respx.mock
+async def test_list_rules_is_allowed_on_read_only_connections():
+    server._read_only.set(True)
+    respx.get(_RULES_URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    assert await server.list_rules() == []
 
 
 @respx.mock
@@ -680,6 +745,7 @@ async def test_create_rule_delete_does_not_mark_read_by_default():
 @respx.mock
 async def test_create_rule_move_with_mark_read():
     import json
+    respx.get(_RULES_URL).mock(return_value=httpx.Response(200, json={"value": []}))
     route = respx.post(_RULES_URL).mock(return_value=httpx.Response(201, json={"id": "r1"}))
     await server.create_rule("M", ["a@example.com"], "move", destination_folder_id="f1",
                              mark_as_read=True, sequence=2)
@@ -694,6 +760,29 @@ async def test_create_rule_validates_arguments():
         await server.create_rule("M", ["a@example.com"], "bogus")
     with pytest.raises(ValueError):
         await server.create_rule("M", [], "delete")
+    with pytest.raises(ValueError):
+        await server.create_rule("M", ["not-an-email"], "delete")
+
+
+@respx.mock
+async def test_create_rule_rejects_duplicate_display_name():
+    respx.get(_RULES_URL).mock(return_value=httpx.Response(
+        200, json={"value": [{"id": "r0", "displayName": "Block", "sequence": 1}]}))
+    post = respx.post(_RULES_URL).mock(return_value=httpx.Response(201, json={"id": "r1"}))
+    with pytest.raises(ValueError, match="already exists"):
+        await server.create_rule("Block", ["a@example.com"], "delete")
+    assert not post.called
+
+
+@respx.mock
+async def test_create_rule_mark_read_only_and_first_sequence():
+    import json
+    respx.get(_RULES_URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    route = respx.post(_RULES_URL).mock(return_value=httpx.Response(201, json={"id": "r1"}))
+    await server.create_rule("Read", ["a@example.com"], "mark_read_only")
+    body = json.loads(route.calls.last.request.content)
+    assert body["sequence"] == 1
+    assert body["actions"] == {"stopProcessingRules": True, "markAsRead": True}
 
 
 @respx.mock

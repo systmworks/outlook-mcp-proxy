@@ -2,21 +2,21 @@
 
 Self-hosted [MCP](https://modelcontextprotocol.io) server that exposes a **personal**
 Outlook.com account (mail + calendar, via Microsoft Graph) to Claude.ai (or any MCP
-client) via a standard OAuth 2.0 flow — no pre-generated credentials, and no tokens
-persisted to disk (they live only in memory — see [How it works](#how-it-works)).
+client) via a standard OAuth 2.0 flow - no pre-generated credentials, and no tokens
+persisted to disk (they live only in memory - see [How it works](#how-it-works)).
 
 **Personal accounts only.** This deliberately uses Microsoft's `consumers`-tenant
-endpoint, which structurally excludes work/school (Azure AD) accounts — only
+endpoint, which structurally excludes work/school (Azure AD) accounts - only
 outlook.com / hotmail.com / live.com-style personal Microsoft accounts can ever sign in.
 
 Sibling project to [gmail-mcp-proxy](https://github.com/systmworks/gmail-mcp-proxy),
-which does the same thing for Gmail — see [Outlook vs Gmail](#outlook-vs-gmail) below
+which does the same thing for Gmail - see [Outlook vs Gmail](#outlook-vs-gmail) below
 for where the two diverge.
 
 ## Quick Links
 
-- [Setup](SETUP.md) — Azure app registration + deployment walkthrough
-- [Changelog](CHANGELOG.md) — version history
+- [Setup](SETUP.md) - Azure app registration + deployment walkthrough
+- [Changelog](CHANGELOG.md) - version history
 
 ## How it works
 
@@ -30,7 +30,7 @@ server to Claude, and internally delegates authentication to Microsoft. After th
 grants access, Microsoft Graph tokens are stored server-side (in memory) and injected
 per-request. A short-lived JWT is issued to Claude as the bearer token.
 
-**Multiple accounts** — add the server twice in Claude with different alias URLs
+**Multiple accounts** - add the server twice in Claude with different alias URLs
 (`/personal/mcp`, `/family/mcp`). Each session is isolated; authenticate each with a
 different Microsoft account.
 
@@ -40,17 +40,18 @@ different Microsoft account.
 |------|-------------|
 | `get_profile` | Outlook account profile |
 | `search_emails` | Search with Graph's `$search` syntax (`from:`, `subject:`, `body:`, `received:`, …) |
+| `list_messages` | Messages inside one specific folder (id or well-known name like `"inbox"`), newest first; `search_emails` can't be scoped to a folder |
 | `read_message` | Full message with decoded body and attachment metadata |
 | `read_conversation` | All messages in a conversation (Outlook's equivalent of a Gmail thread), oldest first |
-| `get_attachment` | Download an attachment's bytes (base64) by `message_id`/`attachment_id` — see `ATTACHMENT_MAX_MB` |
-| `send_email` | Send, or reply within a conversation via `reply_to_message_id` |
-| `create_draft` | Save a draft |
+| `get_attachment` | Download an attachment's bytes (base64) by `message_id`/`attachment_id` - see `ATTACHMENT_MAX_MB` |
+| `send_email` | Send, or reply within a conversation via `reply_to_message_id`; `is_html=True` for an HTML body |
+| `create_draft` | Save a draft (`is_html=True` for an HTML body) |
 | `list_drafts` | List drafts |
 | `send_draft` | Send an existing draft |
 | `update_draft` | Replace the content of an existing draft |
 | `delete_draft` | Permanently delete a draft |
-| `list_folders` | Top-level folders by default; pass `parent_folder_id` (a folder id, or a well-known name like `"inbox"`) to drill into one, `recursive=True` to walk the whole subtree, `name_contains` to search by name, or `minimal=True` to trim the per-folder fields returned (cheaper for large recursive walks) — capped at 200 results |
-| `count_folders` | Count folders in the mailbox (or one subtree via `parent_folder_id`) without returning the list itself — cheaper than `list_folders(recursive=True)` when the question is just "how many" |
+| `list_folders` | Top-level folders by default; pass `parent_folder_id` (a folder id, or a well-known name like `"inbox"`) to drill into one, `recursive=True` to walk the whole subtree, `name_contains` to search by name, or `minimal=True` to trim the per-folder fields returned (cheaper for large recursive walks) - capped at 200 results |
+| `count_folders` | Count folders in the mailbox (or one subtree via `parent_folder_id`) without returning the list itself - cheaper than `list_folders(recursive=True)` when the question is just "how many" |
 | `create_folder` | Create a folder, optionally nested |
 | `update_folder` | Rename a folder |
 | `delete_folder` | Permanently delete a folder |
@@ -60,22 +61,22 @@ different Microsoft account.
 | `move_message` | Move a message to another folder |
 | `mark_as_junk` | Move a message to Junk Email |
 | `trash_message` | Move a message to Deleted Items |
-| `list_rules` | Server-side inbox rules |
-| `create_rule` | Create a server-side rule by sender (delete / move; does not mark read unless asked) |
+| `list_rules` | Server-side inbox rules (see [Server-side rules](#server-side-rules)) |
+| `create_rule` | Create a server-side rule by exact sender address (`delete` / `move` / `mark_read_only`; does not mark read unless asked) |
 | `delete_rule` | Delete a server-side rule |
 | `list_calendars` | All calendars |
-| `list_events` | Events in a time window (defaults to now–+30 days) |
+| `list_events` | Events in a time window (defaults to now-+30 days) |
 | `search_events` | Search events by keyword |
 | `get_event` | Single event by ID |
 
-Calendar is **read-only** in this version, and there are no Contacts tools — both are
+Calendar is **read-only** in this version, and there are no Contacts tools - both are
 easy additions on Graph, deliberately deferred; see [Outlook vs Gmail](#outlook-vs-gmail).
 
 ## Prerequisites
 
 - A GitHub account with this repo forked (or cloned) into it
-- An Azure account (free) — used only to register an OAuth app, no billing needed
-- A place to run the server with HTTPS — self-hosting (Python 3.12+ or Docker) behind
+- An Azure account (free) - used only to register an OAuth app, no billing needed
+- A place to run the server with HTTPS - self-hosting (Python 3.12+ or Docker) behind
   Tailscale or your own reverse proxy is the documented path; see [Setup](SETUP.md)
 
 ## Configuration
@@ -83,30 +84,47 @@ easy additions on Graph, deliberately deferred; see [Outlook vs Gmail](#outlook-
 | Variable | Description |
 |----------|-------------|
 | `MS_CLIENT_ID` | Azure App registration Application (client) ID |
-| `MS_CLIENT_SECRET` | Azure App registration client secret — **expires within 24 months**, see [Notes](#notes) |
+| `MS_CLIENT_SECRET` | Azure App registration client secret - **expires within 24 months**, see [Notes](#notes) |
 | `JWT_SECRET` | Secret for signing session JWTs (any random string) |
 | `BASE_URL` | Public base URL, no trailing slash, e.g. `https://outlook-mcp-proxy.your-tailnet.ts.net` |
-| `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
+| `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) - only change this if you're connecting a non-Claude.ai MCP client. |
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
-| `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `family`) that should be restricted to read-only access — no send, draft, folder/category changes, or move/trash. See below. |
-| `API_RETRY_ATTEMPTS` | Optional. Total attempts (1–5) for an outbound Graph API call (read or write) before giving up on a retryable status (429/5xx). Defaults to `2`. Honors a `Retry-After` response header from Graph when present, in either delay-seconds or HTTP-date form. |
-| `ATTACHMENT_MAX_MB` | Optional. Max attachment size (1–25MB, decoded) `get_attachment` will fetch. Defaults to `3`. Attachment bytes return as base64 text inside the MCP tool result — straight into the calling LLM's context, not just over the network. |
+| `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `family`) that should be restricted to read-only access - no send, draft, folder/category changes, rule changes, or move/trash. See below. |
+| `API_RETRY_ATTEMPTS` | Optional. Total attempts (1-5) for an outbound Graph API call (read or write) before giving up on a retryable status (429/5xx). Defaults to `2`. Honors a `Retry-After` response header from Graph when present, in either delay-seconds or HTTP-date form. |
+| `ATTACHMENT_MAX_MB` | Optional. Max attachment size (1-25MB, decoded) `get_attachment` will fetch. Defaults to `3`. Attachment bytes return as base64 text inside the MCP tool result - straight into the calling LLM's context, not just over the network. |
 | `PORT` | Optional. Port the server listens on. Defaults to `8000`. |
 
 ## Read-only accounts
 
-To connect an account you want Claude to only ever read from — never send, delete, or
-modify — add its alias to `READ_ONLY_ALIASES`, e.g. `READ_ONLY_ALIASES=family` for a
+To connect an account you want Claude to only ever read from - never send, delete, or
+modify - add its alias to `READ_ONLY_ALIASES`, e.g. `READ_ONLY_ALIASES=family` for a
 connector added at `/family/mcp`. That account's Microsoft OAuth grant will only ever
-request `Mail.Read`/`Calendars.Read` — no write scope is ever issued for it, so even a
+request read scopes (`Mail.Read`, `Calendars.Read`, `MailboxSettings.Read`, plus the
+sign-in basics `openid`, `offline_access` and `User.Read`) - no write scope is ever issued for it, so even a
 bug in this server can't make it send or delete anything; Graph rejects it regardless.
 The server also refuses write tool calls itself with a clear error, as a second layer.
 
-**Enforcement is server-side and unconditional** — which alias a request comes in
+**Enforcement is server-side and unconditional** - which alias a request comes in
 through is derived from the URL path on every single request, both at `/authorize`
 (when deciding which Microsoft OAuth scopes to request) and on every `/mcp` call
 afterward, not something the client asserts. A restricted alias stays restricted
 even if its bearer token is ever presented to a different connector's endpoint.
+
+## Server-side rules
+
+`list_rules`, `create_rule` and `delete_rule` manage Outlook inbox rules through Graph's
+`mailFolders/inbox/messageRules`. These run inside Exchange when mail arrives, so a rule
+that deletes or moves mail from a sender does **not** mark it read (marking read is a
+separate action you opt into) - unlike moving messages from a client.
+
+- They need the `MailboxSettings.Read` (list) and `MailboxSettings.ReadWrite` (create/delete)
+  scopes. An account connected before these tools existed must be removed and re-added in
+  Claude so the Microsoft consent screen grants them; a 403 mentioning `MailboxSettings`
+  means that consent is missing.
+- `create_rule` matches **exact** sender addresses, only for the Inbox, refuses a
+  `display_name` that is already used, and `move` needs a real folder id from `list_folders`.
+- `list_rules` also shows `exceptions` and `hasError`. There is no edit tool - delete and
+  re-create.
 
 ## Development
 
@@ -118,7 +136,7 @@ mypy            # type check (config in pyproject.toml)
 ```
 
 Tests mock all Graph API calls (via `respx`) and cover the pure-logic helpers (PKCE,
-alias parsing, recipient parsing) plus tool behavior that's easy to get wrong — the
+alias parsing, recipient parsing) plus tool behavior that's easy to get wrong - the
 consumers-tenant-only OAuth requirement, refresh-token rotation, read-only enforcement,
 and `move_message`'s new-id semantics. No live Microsoft credentials needed to run them.
 
@@ -129,31 +147,37 @@ Where this diverges from the [Gmail sibling project](https://github.com/systmwor
 **Harder / more work:**
 - Categories need read-modify-write (no atomic add/remove on Graph), vs. Gmail's atomic label add/remove.
 - Calendar listing needs two different endpoints (`calendarView` for time-range/recurrence-expansion vs. `events`/`$search`), vs. Gmail's single consistent surface.
-- `move_message` returns a **new** message id — anything holding the old id afterward will fail. Gmail message ids never change.
-- `move_folder`, by contrast, keeps the folder's **original** id — confirmed by live testing; only `parentFolderId` changes.
+- `move_message` returns a **new** message id - anything holding the old id afterward will fail. Gmail message ids never change.
+- `move_folder`, by contrast, keeps the folder's **original** id - confirmed by live testing; only `parentFolderId` changes.
 - Folder hierarchy is a real tree (`parentFolderId`), vs. Gmail's flat `/`-named labels.
-- Two account-registration facts must be exactly right, with no forgiving fallback: the `consumers`-tenant-only endpoint, and "Personal Microsoft accounts only" in Azure Portal — get either wrong and work/school accounts could authenticate.
-- The Azure client secret **expires within 24 months** (Google's doesn't) — needs a calendar reminder, not a code fix.
-- Refresh tokens **roll on every use** and expire after ~90 days of account *inactivity* — a different failure mode than Google's, and the rotated token must always be re-stored.
+- Two account-registration facts must be exactly right, with no forgiving fallback: the `consumers`-tenant-only endpoint, and "Personal Microsoft accounts only" in Azure Portal - get either wrong and work/school accounts could authenticate.
+- The Azure client secret **expires within 24 months** (Google's doesn't) - needs a calendar reminder, not a code fix.
+- Refresh tokens **roll on every use** and expire after ~90 days of account *inactivity* - a different failure mode than Google's, and the rotated token must always be re-stored.
 
 **Easier / genuine advantages:**
-- `read_message` is simpler — `body.content`/`body.contentType` arrive as ready JSON, no MIME-tree walking or base64url decoding.
-- Attachment ids are **stable** across repeated reads of the same message — no Gmail-style partId/attachmentId mismatch bug to work around.
-- Reply is a native Graph action (`/reply`) — no manual `In-Reply-To`/`References` MIME header construction.
+- `read_message` is simpler - `body.content`/`body.contentType` arrive as ready JSON, no MIME-tree walking or base64url decoding.
+- Attachment ids are **stable** across repeated reads of the same message - no Gmail-style partId/attachmentId mismatch bug to work around.
+- Reply is a native Graph action (`/reply`) - no manual `In-Reply-To`/`References` MIME header construction.
 - `$search` on messages returns full fields per hit already, with no separate enrichment round-trip needed (Gmail's `search_emails` needs one).
-- Graph explicitly documents and honors `Retry-After` — a more reliable throttling signal than Gmail's docs provide.
-- Calendar write, free/busy, `findMeetingTimes`, and a full Contacts API are all natively easy on Graph — deliberately deferred here, not technical gaps.
+- Graph explicitly documents and honors `Retry-After` - a more reliable throttling signal than Gmail's docs provide.
+- Calendar write, free/busy, `findMeetingTimes`, and a full Contacts API are all natively easy on Graph - deliberately deferred here, not technical gaps.
 
 ## Notes
 
-- Sessions are stored in memory — a server restart requires re-authentication in Claude.ai
-- Runs as a single process — don't scale to multiple replicas or `uvicorn --workers N`.
+- The running version is logged at startup (`journalctl -u outlook-mcp-proxy | grep starting`)
+  and matches the newest [Changelog](CHANGELOG.md) entry.
+- If you expose the server with Tailscale Funnel, `/authorize`, `/token` and the OAuth
+  metadata are reachable from the public internet by design (Claude's servers need them).
+  They are bounded (a cap on pending sign-ins, PKCE and a redirect allowlist) and `/mcp`
+  needs a valid bearer token, but treat the URL as public.
+- Sessions are stored in memory - a server restart requires re-authentication in Claude.ai
+- Runs as a single process - don't scale to multiple replicas or `uvicorn --workers N`.
   Session/state stores are per-process in-memory, so a request landing on a different
   process than the one that authenticated it would fail as if unauthenticated.
 - Microsoft access tokens are refreshed automatically using the stored refresh token,
-  which Microsoft frequently rotates on every use — the server always stores whatever
+  which Microsoft frequently rotates on every use - the server always stores whatever
   comes back.
-- Personal Microsoft account refresh tokens roll on a ~90-day *inactivity* window —
+- Personal Microsoft account refresh tokens roll on a ~90-day *inactivity* window -
   an account genuinely unused for that long needs the same re-auth as after a restart.
 - The Azure app registration's client secret expires within 24 months. Rotate it in
   Azure Portal → your app → Certificates & secrets before then, update

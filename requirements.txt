@@ -1,4 +1,4 @@
-# Exact-pinned (unlike the range-pinned deps below) — bump deliberately and
+# Exact-pinned (unlike the range-pinned deps below) - bump deliberately and
 # test before widening to a range.
 fastmcp==3.3.1
 PyJWT>=2.10.1,<3

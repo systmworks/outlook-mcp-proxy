@@ -93,7 +93,7 @@ async def test_authorize_includes_pkce_challenge_for_microsoft_leg(asgi_client):
 
 async def test_authorize_sets_read_only_when_path_alias_is_restricted(asgi_client):
     # read_only is decided from the server-verified URL path alias, not a
-    # client-supplied query param — see the regression test below for why.
+    # client-supplied query param - see the regression test below for why.
     original = server.READ_ONLY_ALIASES
     server.READ_ONLY_ALIASES = frozenset({"work"})
     try:
@@ -116,7 +116,7 @@ async def test_authorize_ignores_client_supplied_resource_param(asgi_client):
     # client-echoed 'resource' query param instead of the server-verified
     # path alias. A client that omitted or mismatched 'resource' got a
     # read_only=False token even when authenticating through a restricted
-    # alias — and since the JWT's own read_only claim (not which alias it was
+    # alias - and since the JWT's own read_only claim (not which alias it was
     # minted for) is what travels with the token, that token's write access
     # then depended on which endpoint it was later presented to, letting it
     # bypass the restriction entirely if presented to the unaliased /mcp.
@@ -208,7 +208,7 @@ async def test_auth_callback_returns_502_when_no_email_resolvable(asgi_client, s
 @respx.mock
 async def test_auth_callback_retries_transient_token_exchange_failure(asgi_client, state):
     # Regression test: _auth_callback previously used a raw httpx call with no
-    # retry, inconsistent with every other outbound Graph/MS call in this file —
+    # retry, inconsistent with every other outbound Graph/MS call in this file -
     # a single transient 5xx during the one-time code exchange failed the whole
     # login instead of recovering.
     respx.post(server.MS_TOKEN_URL).mock(side_effect=[
@@ -323,7 +323,7 @@ async def test_refresh_updates_access_token_on_success():
 @respx.mock
 async def test_refresh_rotates_refresh_token_when_microsoft_returns_a_new_one():
     # Microsoft frequently rotates the refresh token on every use, unlike
-    # Google's more static ones — the new one must always be stored, or the
+    # Google's more static ones - the new one must always be stored, or the
     # *next* refresh fails with a reused/invalid refresh_token.
     jti = "jti-rotate"
     server._token_store[jti] = {
@@ -385,12 +385,70 @@ async def test_refresh_concurrent_calls_for_same_session_issue_one_http_request(
         server._refresh_locks.pop(jti, None)
 
 
+def _expired_session(jti: str) -> None:
+    server._token_store[jti] = {
+        "access_token": "old", "refresh_token": "rtok",
+        "expiry": time.time() - 100, "email": "a@example.com", "read_only": False,
+        "jwt_exp": time.time() + 1000,
+    }
+
+
+@respx.mock
+@pytest.mark.parametrize("response", [
+    httpx.Response(503, json={"error": "temporarily_unavailable"}),
+    httpx.Response(429, json={"error": "too_many_requests"}),
+    httpx.Response(500, text="<html>oops</html>"),
+])
+async def test_refresh_keeps_session_on_transient_microsoft_error(response):
+    # A throttled or erroring token endpoint is not a revoked grant - the session
+    # must survive so the next request can retry, instead of forcing a re-login.
+    jti = "jti-transient"
+    _expired_session(jti)
+    respx.post(server.MS_TOKEN_URL).mock(return_value=response)
+    try:
+        with pytest.raises(server.UpstreamUnavailable):
+            await server._refresh(jti)
+        assert jti in server._token_store
+    finally:
+        server._token_store.pop(jti, None)
+        server._refresh_locks.pop(jti, None)
+
+
+async def test_mcp_endpoint_returns_503_not_401_on_transient_upstream_error(asgi_client, monkeypatch):
+    async def boom(jti):
+        raise server.UpstreamUnavailable("Microsoft down")
+
+    monkeypatch.setattr(server, "_ms_access_token", boom)
+    token = _make_jwt("any-jti")
+    r = await asgi_client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 503
+
+
+async def test_mcp_endpoint_returns_500_not_401_on_unexpected_error(asgi_client, monkeypatch):
+    async def boom(jti):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(server, "_ms_access_token", boom)
+    token = _make_jwt("any-jti")
+    r = await asgi_client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 500
+
+
+async def test_authorize_refuses_when_pending_state_cap_is_reached(asgi_client, monkeypatch):
+    monkeypatch.setattr(server, "_MAX_PENDING_STATES", 0)
+    r = await asgi_client.get("/authorize", params={
+        "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+        "code_challenge": "test-challenge",
+    })
+    assert r.status_code == 503
+
+
 # ── _purge_expired_tokens ───────────────────────────────────────────────────
 
 async def test_purge_expired_tokens_skips_session_with_in_flight_refresh():
     # Regression test: _purge_expired_tokens previously popped an expired
     # session's _token_store/_refresh_locks entry unconditionally, even while
-    # _refresh was still awaiting Microsoft's response for that same session —
+    # _refresh was still awaiting Microsoft's response for that same session -
     # the refreshed token would then be written into a dict no longer in the
     # store, silently losing the session despite _refresh reporting success.
     jti = "jti-purge-race"
@@ -440,8 +498,8 @@ async def test_mcp_endpoint_rejects_non_bearer_scheme(asgi_client):
 
 async def test_mcp_endpoint_rejects_malformed_non_utf8_header_cleanly():
     # Regression test: non-UTF-8 bytes in the Authorization header must not raise
-    # an uncaught UnicodeDecodeError — every other malformed-input case here gets
-    # a clean 401. Drives the raw ASGI scope directly — httpx's own header
+    # an uncaught UnicodeDecodeError - every other malformed-input case here gets
+    # a clean 401. Drives the raw ASGI scope directly - httpx's own header
     # encoding won't reproduce invalid UTF-8 bytes.
     scope = {"type": "http", "path": "/mcp", "headers": [(b"authorization", b"Bearer \xff\xfe")]}
     sent = []
@@ -475,7 +533,7 @@ async def _stub_mcp(scope, receive, send):
 
 async def test_mcp_endpoint_accepts_valid_jwt_with_known_session(asgi_client):
     # FastMCP's real mounted app needs its session manager started via the ASGI
-    # lifespan protocol, which httpx.ASGITransport doesn't drive — swap in a
+    # lifespan protocol, which httpx.ASGITransport doesn't drive - swap in a
     # trivial stub so this only exercises the bearer-auth branch in _App.__call__,
     # not FastMCP's internals.
     jti = "known-jti"

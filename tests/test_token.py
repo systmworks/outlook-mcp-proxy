@@ -66,3 +66,17 @@ async def test_token_issues_jwt_with_expected_claims(code):
     assert payload["jti"] == "test-jti"
     assert payload["email"] == "x@example.com"
     assert payload["read_only"] is False
+    assert r.headers["cache-control"] == "no-store"
+    assert r.headers["pragma"] == "no-cache"
+
+
+async def test_token_rejects_mismatched_redirect_uri(code):
+    verifier = "a-valid-verifier-string-1234567890"
+    digest = hashlib.sha256(verifier.encode()).digest()
+    server._code_store[code]["code_challenge"] = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.post("/token", data={"code": code, "code_verifier": verifier,
+                                         "redirect_uri": "https://evil.example.com/cb"})
+    assert r.status_code == 400
+    assert r.json() == {"error": "invalid_grant"}

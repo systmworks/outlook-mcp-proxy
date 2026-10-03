@@ -1,7 +1,7 @@
 """
-Outlook MCP Server — FastMCP + Microsoft identity platform OAuth proxy
+Outlook MCP Server - FastMCP + Microsoft identity platform OAuth proxy
 
-Personal (consumers-tenant) Microsoft accounts only — never /common or
+Personal (consumers-tenant) Microsoft accounts only - never /common or
 /organizations, so work/school accounts structurally cannot authenticate here.
 
 Flow:
@@ -38,19 +38,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("outlook_mcp")
 
+# Keep in step with the newest CHANGELOG.md entry. Logged at startup and reported to
+# MCP clients, so a deployed container's version can be confirmed.
+VERSION = "0.15"
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 MS_CLIENT_ID = os.environ["MS_CLIENT_ID"]
 MS_CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]
 BASE_URL = os.environ["BASE_URL"].rstrip("/")  # e.g. https://outlook-mcp-proxy.your-tailnet.ts.net
 JWT_SECRET = os.environ["JWT_SECRET"]
+if len(JWT_SECRET.encode()) < 32:
+    log.warning("JWT_SECRET is shorter than 32 bytes - use a longer random value (openssl rand -hex 32)")
 
 HTTPX_TIMEOUT = 30.0
 STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
+_MAX_PENDING_STATES = 500  # cap on in-flight /authorize states (memory-exhaustion guard)
 
 # Max attachment size (decoded bytes) get_attachment will fetch/return. Attachment
-# bytes come back as base64 text inside the MCP tool result — i.e. straight into the
-# calling LLM's context, not just over the network — so the default is kept small
+# bytes come back as base64 text inside the MCP tool result - i.e. straight into the
+# calling LLM's context, not just over the network - so the default is kept small
 # (base64 inflates ~33% and tokenizes poorly). Raise it if you need larger
 # attachments and have the context budget.
 ATTACHMENT_MAX_MB = max(1, min(25, int(os.environ.get("ATTACHMENT_MAX_MB", "3"))))
@@ -61,7 +68,7 @@ DEFAULT_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
 # an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
 # the victim completes Microsoft's consent screen, receive the resulting single-use code
-# themselves — full account takeover if PKCE isn't also enforced (see _authorize below).
+# themselves - full account takeover if PKCE isn't also enforced (see _authorize below).
 ALLOWED_REDIRECT_URIS = frozenset(
     u.strip() for u in os.environ.get(
         "ALLOWED_REDIRECT_URIS", DEFAULT_REDIRECT_URI
@@ -80,12 +87,12 @@ def _parse_read_only_aliases(value: str) -> frozenset[str]:
 
 
 # Aliased connectors (e.g. /work/mcp) named here get Microsoft Graph scopes covering
-# only read access — decided from the URL path alias at /authorize (see
+# only read access - decided from the URL path alias at /authorize (see
 # _ms_scopes() and _split_alias()), and re-enforced per-request regardless
 # (see _effective_read_only()).
 READ_ONLY_ALIASES = _parse_read_only_aliases(os.environ.get("READ_ONLY_ALIASES", ""))
 
-# consumers-tenant-only — the single most important line in this file. Using /common
+# consumers-tenant-only - the single most important line in this file. Using /common
 # or /organizations here would let work/school (Azure AD) accounts authenticate too;
 # /consumers structurally restricts this server to personal Microsoft accounts.
 MS_AUTHORIZE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
@@ -93,7 +100,7 @@ MS_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 
 MS_SCOPES_BASE = [
     "openid",
-    "offline_access",  # required to get a refresh token at all — easy to forget
+    "offline_access",  # required to get a refresh token at all - easy to forget
     "User.Read",
     "Mail.Read",
     "Calendars.Read",
@@ -115,26 +122,30 @@ def _ms_scopes(read_only: bool) -> str:
 GRAPH = "https://graph.microsoft.com/v1.0"
 ME = f"{GRAPH}/me"
 
-# Outbound Graph API calls retry on these — rate limiting and server errors are
+# Outbound Graph API calls retry on these - rate limiting and server errors are
 # usually transient. Other 4xx (403/404, etc.) are permanent.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
 
 # Total attempts (including the first) for an outbound Graph API call before giving
 # up. A bulk operation otherwise fails outright the moment Graph rate-limits a
 # single call, with no chance to recover.
 API_RETRY_ATTEMPTS = max(1, min(5, int(os.environ.get("API_RETRY_ATTEMPTS", "2"))))
 _API_RETRY_DELAY = 0.3  # seconds between attempts, unless Retry-After says otherwise
-_MAX_RETRY_DELAY = 60.0  # cap a Retry-After value — a bogus "inf"/huge value must not hang a call
+# OAuth error codes meaning "try again later", as opposed to a definitive grant failure
+# (invalid_grant, invalid_client, ...) that really does mean the session is dead.
+_TRANSIENT_OAUTH_ERRORS = frozenset({"temporarily_unavailable", "server_error"})
+_MAX_RETRY_DELAY = 60.0  # cap a Retry-After value - a bogus "inf"/huge value must not hang a call
 
 # Shared connection-pooled client for all outbound Graph/Microsoft OAuth requests.
-# Created/closed around the ASGI lifespan in _App.__call__ — avoids paying a fresh
+# Created/closed around the ASGI lifespan in _App.__call__ - avoids paying a fresh
 # TCP+TLS handshake to graph.microsoft.com on every single tool call.
 _http_client: httpx.AsyncClient | None = None
 
 
 def _client() -> httpx.AsyncClient:
     if _http_client is None:
-        raise RuntimeError("HTTP client not initialized — server lifespan hasn't started")
+        raise RuntimeError("HTTP client not initialized - server lifespan hasn't started")
     return _http_client
 
 
@@ -157,6 +168,11 @@ class ReauthRequired(Exception):
     """Raised when a session is unknown or Microsoft has revoked/expired the refresh token."""
 
 
+class UpstreamUnavailable(Exception):
+    """Raised when Microsoft couldn't be reached or answered with a transient error
+    during a token refresh. The session is still valid - retrying later may work."""
+
+
 def _pkce_ok(verifier: str, challenge: str) -> bool:
     digest = hashlib.sha256(verifier.encode()).digest()
     computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
@@ -165,7 +181,7 @@ def _pkce_ok(verifier: str, challenge: str) -> bool:
 
 def _new_pkce_pair() -> tuple[str, str]:
     """A fresh (verifier, challenge) pair for this server's own client role toward
-    Microsoft — kept independent of whatever PKCE pair Claude used against us."""
+    Microsoft - kept independent of whatever PKCE pair Claude used against us."""
     verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(verifier.encode()).digest()
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
@@ -173,7 +189,7 @@ def _new_pkce_pair() -> tuple[str, str]:
 
 
 def _resolve_email(profile: dict) -> str:
-    """Personal Microsoft accounts can return `mail: null` from /me — the real
+    """Personal Microsoft accounts can return `mail: null` from /me - the real
     address then only appears in `userPrincipalName`."""
     return profile.get("mail") or profile.get("userPrincipalName") or ""
 
@@ -200,7 +216,7 @@ def _purge_expired_tokens() -> None:
             # was triggered by a completely unrelated concurrent request). Popping
             # the entry out from under it would let _refresh write a "successful"
             # refresh into a dict that's no longer in the store, silently losing
-            # the session. Leave it — the next purge pass will catch it once the
+            # the session. Leave it - the next purge pass will catch it once the
             # refresh finishes and releases the lock, assuming jwt_exp is still past.
             continue
         _token_store.pop(jti, None)
@@ -218,17 +234,28 @@ async def _refresh(jti: str) -> str:
         if time.time() < d["expiry"] - 60:
             # Another coroutine already refreshed while we waited on the lock.
             return d["access_token"]
-        r = await _request_with_retry("POST", MS_TOKEN_URL, data={
+        r = await _request_with_retry("POST", MS_TOKEN_URL, retry_unsafe=True, data={
             "client_id": MS_CLIENT_ID,
             "client_secret": MS_CLIENT_SECRET,
             "refresh_token": d["refresh_token"],
             "grant_type": "refresh_token",
             "scope": _ms_scopes(d.get("read_only", False)),
         })
-        t = r.json()
+        try:
+            t = r.json()
+        except ValueError:
+            t = {}
+        if not isinstance(t, dict):
+            t = {}
         log.info("session %s: refresh response has_access_token=%s expires_in=%s",
                  jti, "access_token" in t, t.get("expires_in"))
         if "access_token" not in t:
+            if r.status_code in _RETRYABLE_STATUSES or t.get("error") in _TRANSIENT_OAUTH_ERRORS or not t:
+                # Microsoft is throttling/erroring, not rejecting the grant - keep
+                # the session so the next request can retry the refresh.
+                log.warning("token refresh hit a transient Microsoft error (status %s): %s",
+                            r.status_code, t.get("error", "no/invalid body"))
+                raise UpstreamUnavailable(f"Microsoft token endpoint unavailable (status {r.status_code})")
             _token_store.pop(jti, None)
             _refresh_locks.pop(jti, None)
             reason = t.get("error_description", t.get("error", "refresh failed"))
@@ -237,7 +264,7 @@ async def _refresh(jti: str) -> str:
         d["access_token"] = t["access_token"]
         d["expiry"] = time.time() + t.get("expires_in", 3600)
         # Microsoft frequently rotates the refresh token on every use (unlike
-        # Google's more static ones) — always store whatever comes back, or the
+        # Google's more static ones) - always store whatever comes back, or the
         # *next* refresh will fail with a reused/invalid refresh_token.
         new_refresh = t.get("refresh_token")
         if new_refresh:
@@ -261,7 +288,7 @@ async def _ms_access_token(jti: str) -> str:
 
 async def _auth() -> dict:
     # Resolves the token from _token_store at the moment of use rather than trusting
-    # a value captured earlier — see the Gmail sibling project's history for why a
+    # a value captured earlier - see the Gmail sibling project's history for why a
     # cached/ContextVar-captured token can end up stale by the time a tool call
     # actually runs on a different asyncio Task than the one that refreshed it.
     jti = _session_jti.get()
@@ -291,21 +318,34 @@ def _parse_retry_after(value: str) -> float | None:
     return seconds if math.isfinite(seconds) else None
 
 
-async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Response:
-    """Graph API call with retry — up to API_RETRY_ATTEMPTS total tries on
-    retryable statuses (429, 5xx) before giving up, honoring a Retry-After
-    response header (delay-seconds or HTTP-date) when Graph sends one. Used for
-    both read and write calls. A network-level error (timeout, connection reset)
-    is NOT retried and propagates immediately — whether the request already
-    landed server-side is ambiguous, and blindly retrying a non-idempotent write
-    (e.g. sendMail) risks duplicating it. Callers keep calling r.raise_for_status()
-    as before: a final retryable-status response is returned as-is (so that still
-    raises)."""
+def _should_retry(method: str, status: int, retry_unsafe: bool) -> bool:
+    """429 means Graph throttled the request before processing it, so retrying is
+    safe for any method. A 5xx is ambiguous (the write may have landed before the
+    error), so it is only retried for idempotent methods unless the caller opts in
+    via retry_unsafe (the Microsoft token endpoint, where a repeat is harmless)."""
+    if status == 429:
+        return True
+    if status in _RETRYABLE_STATUSES:
+        return retry_unsafe or method.upper() in _IDEMPOTENT_METHODS
+    return False
+
+
+async def _request_with_retry(method: str, url: str, *, retry_unsafe: bool = False,
+                              **kwargs: Any) -> httpx.Response:
+    """Graph API call with retry - up to API_RETRY_ATTEMPTS total tries on
+    retryable statuses before giving up, honoring a Retry-After response header
+    (delay-seconds or HTTP-date) when Graph sends one. Used for both read and
+    write calls. 429 is retried for every method; 5xx only for idempotent methods
+    (see _should_retry), so a non-idempotent write (sendMail, create_rule, ...)
+    is never duplicated by a retry. A network-level error (timeout, connection
+    reset) is NOT retried and propagates immediately, for the same reason.
+    Callers keep calling r.raise_for_status() as before: a final retryable-status
+    response is returned as-is (so that still raises)."""
     c = _client()
     r: httpx.Response | None = None
     for attempt in range(1, API_RETRY_ATTEMPTS + 1):
         r = await c.request(method, url, **kwargs)
-        if r.status_code not in _RETRYABLE_STATUSES:
+        if not _should_retry(method, r.status_code, retry_unsafe):
             return r
         if attempt < API_RETRY_ATTEMPTS:
             delay = _API_RETRY_DELAY
@@ -323,21 +363,37 @@ async def _call(method: str, url: str, *, headers: dict | None = None, **kwargs:
     """Authenticated Graph call: injects the bearer token (merged with any
     extra headers a caller needs, e.g. a Prefer header), goes through
     _request_with_retry, and raises on any error status. Shared by nearly
-    every tool — this is the one place that shape is assembled."""
+    every tool - this is the one place that shape is assembled."""
     merged_headers = {**await _auth(), **(headers or {})}
     r = await _request_with_retry(method, url, headers=merged_headers, **kwargs)
-    r.raise_for_status()
+    if r.is_error:
+        # Keep Graph's own error code/message (e.g. a 403 naming the missing
+        # scope) - the bare httpx status error discards it.
+        raise httpx.HTTPStatusError(
+            f"{r.status_code} {r.reason_phrase} for {method} {r.url.path}: {_graph_error_detail(r)}",
+            request=r.request, response=r)
     return r
 
 
+def _graph_error_detail(r: httpx.Response) -> str:
+    try:
+        body = r.json()
+    except ValueError:
+        body = None
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict) and (err.get("code") or err.get("message")):
+        return f"{err.get('code', '')}: {err.get('message', '')}".strip(": ")
+    return r.text[:200] or "no response body"
+
+
 async def _call_list(method: str, url: str, **kwargs: Any) -> list[dict]:
-    """Like _call, for the common case of a Graph collection response — the
+    """Like _call, for the common case of a Graph collection response - the
     actual items are under the "value" key."""
     r = await _call(method, url, **kwargs)
     return r.json().get("value", [])
 
 
-_MAX_PAGINATION_PAGES = 50  # hard cap — mirrors depth<6 in list_folders' recursive walk;
+_MAX_PAGINATION_PAGES = 50  # hard cap - mirrors depth<6 in list_folders' recursive walk;
                              # a self-referential or never-terminating @odata.nextLink
                              # (e.g. from a misbehaving proxy/cache) must not hang a call forever.
 
@@ -347,11 +403,11 @@ async def _call_list_all(method: str, url: str, *, headers: dict | None = None,
     """Like _call_list, but follows @odata.nextLink until exhausted (or
     _MAX_PAGINATION_PAGES pages, whichever comes first) instead of returning
     just the first page. Use this only where the caller needs the COMPLETE
-    collection to behave correctly (e.g. enumerating every child folder) —
+    collection to behave correctly (e.g. enumerating every child folder) -
     everywhere else, a tool's own $top/max_results is a deliberate page size
     the caller chose, not an accidental truncation to fix. headers (e.g. a
     Prefer header) are resent on every page; params/other kwargs only on the
-    first — nextLink already encodes the full query string for later pages."""
+    first - nextLink already encodes the full query string for later pages."""
     items: list[dict] = []
     next_url: str | None = url
     first = True
@@ -373,7 +429,7 @@ def _require_write() -> None:
 
 def _effective_read_only(payload: dict, alias: str) -> bool:
     """A restricted alias stays restricted even if the JWT itself says
-    read_only=False — e.g. because the OAuth client never echoed back the
+    read_only=False - e.g. because the OAuth client never echoed back the
     'resource' parameter that read_only was originally decided from. `alias`
     here comes from server-side path routing (_split_alias), not anything the
     client asserts, so this can't be bypassed by client behavior."""
@@ -383,7 +439,7 @@ def _effective_read_only(payload: dict, alias: str) -> bool:
 def _enc(value: str) -> str:
     """URL-encode a value for safe interpolation into a Graph REST path segment.
     Graph entity ids are documented to sometimes contain '/' (a reserved path
-    delimiter) — without this, such an id would split the request onto an
+    delimiter) - without this, such an id would split the request onto an
     unintended path instead of addressing the resource it names."""
     return quote(value, safe="")
 
@@ -406,10 +462,19 @@ def _parse_recipients(addresses: str) -> list[dict]:
     return [{"emailAddress": {"address": a.strip()}} for a in addresses.split(",") if a.strip()]
 
 
-def _build_message(subject: str, body: str, to: str, cc: str = "") -> dict:
+_MAX_TOP = 1000  # Graph's own ceiling for $top on message/event collections
+
+
+def _clamp_top(value: int) -> int:
+    """Bound a caller-supplied max_results to a value Graph will accept, so a
+    negative or absurd number can't become a malformed $top."""
+    return max(1, min(int(value), _MAX_TOP))
+
+
+def _build_message(subject: str, body: str, to: str, cc: str = "", is_html: bool = False) -> dict:
     message: dict = {
         "subject": subject,
-        "body": {"contentType": "Text", "content": body},
+        "body": {"contentType": "HTML" if is_html else "Text", "content": body},
         "toRecipients": _parse_recipients(to),
     }
     if cc:
@@ -418,7 +483,7 @@ def _build_message(subject: str, body: str, to: str, cc: str = "") -> dict:
 
 
 def _draft_summary(data: dict) -> dict:
-    """Graph ignores $select on POST/PATCH — a create/update draft call always
+    """Graph ignores $select on POST/PATCH - a create/update draft call always
     returns the complete message resource (full body included) no matter what
     query params are sent. Trim it down here in Python instead, since the
     caller already knows what it just wrote and only needs enough back to
@@ -441,7 +506,10 @@ def _move_summary(data: dict) -> dict:
 
 
 def _rule_summary(data: dict) -> dict:
-    return {k: data.get(k) for k in ("id", "displayName", "sequence", "isEnabled", "conditions", "actions")}
+    """Include exceptions and hasError: a rule with exceptions is narrower than its
+    conditions suggest, and hasError flags a rule Outlook has disabled itself."""
+    return {k: data.get(k) for k in ("id", "displayName", "sequence", "isEnabled", "hasError",
+                                     "conditions", "exceptions", "actions")}
 
 
 def _calendar_base(calendar_id: str) -> str:
@@ -450,7 +518,7 @@ def _calendar_base(calendar_id: str) -> str:
 
 # ── FastMCP tools ──────────────────────────────────────────────────────────────
 
-mcp = FastMCP("Outlook MCP")
+mcp = FastMCP("Outlook MCP", version=VERSION)
 
 
 @mcp.tool
@@ -467,30 +535,30 @@ _MESSAGE_SELECT = ("id,conversationId,subject,from,toRecipients,receivedDateTime
 @mcp.tool
 async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     """Search mail using Microsoft Graph's $search syntax (from:, subject:, body:,
-    participants:, received:, etc. — similar power to Gmail's operators, but not
+    participants:, received:, etc. - similar power to Gmail's operators, but not
     the same syntax). Each hit already includes from/subject/receivedDateTime/
-    preview/categories/hasAttachments in this one call — no separate enrichment
+    preview/categories/hasAttachments in this one call - no separate enrichment
     round-trip needed, unlike the Gmail equivalent. This searches the whole
-    mailbox regardless of folder — use list_messages instead to see what's in
+    mailbox regardless of folder - use list_messages instead to see what's in
     one specific folder."""
     return await _call_list("GET", f"{ME}/messages", params={
         "$search": f'"{_escape_search_phrase(query)}"',
-        "$top": max_results,
+        "$top": _clamp_top(max_results),
         "$select": _MESSAGE_SELECT,
     })
 
 
 @mcp.tool
 async def list_messages(folder_id: str, max_results: int = 20) -> list[dict]:
-    """List messages actually inside one specific folder, newest first — a
+    """List messages actually inside one specific folder, newest first - a
     folder id from list_folders, or a well-known name like "inbox"/"drafts"/
     "sentitems". Unlike search_emails (which searches the whole mailbox via
     Graph's $search and cannot be scoped to a folder), this is the tool for
-    "what's really in this folder" — e.g. auditing a folder whose name alone
+    "what's really in this folder" - e.g. auditing a folder whose name alone
     doesn't tell you what it actually contains before deciding where it
     belongs."""
     return await _call_list("GET", f"{ME}/mailFolders/{_enc(folder_id)}/messages", params={
-        "$top": max_results,
+        "$top": _clamp_top(max_results),
         "$orderby": "receivedDateTime desc",
         "$select": _MESSAGE_SELECT,
     })
@@ -509,7 +577,7 @@ def _attachment_summary(a: dict) -> dict:
 @mcp.tool
 async def read_message(message_id: str) -> dict:
     """Read an Outlook message by ID. Returns headers, body (already-decoded
-    content — Graph gives plain/HTML text directly, no MIME/base64 decoding
+    content - Graph gives plain/HTML text directly, no MIME/base64 decoding
     needed), and attachment metadata (use get_attachment to download bytes)."""
     r = await _call("GET", f"{ME}/messages/{_enc(message_id)}")
     data = r.json()
@@ -525,8 +593,8 @@ async def read_message(message_id: str) -> dict:
         "id": data["id"],
         "conversationId": data.get("conversationId", ""),
         "from": (data.get("from") or {}).get("emailAddress", {}).get("address", ""),
-        "to": [r["emailAddress"]["address"] for r in data.get("toRecipients", [])],
-        "cc": [r["emailAddress"]["address"] for r in data.get("ccRecipients", [])],
+        "to": [x["emailAddress"]["address"] for x in data.get("toRecipients", [])],
+        "cc": [x["emailAddress"]["address"] for x in data.get("ccRecipients", [])],
         "subject": data.get("subject", ""),
         "date": data.get("receivedDateTime", ""),
         "bodyPreview": data.get("bodyPreview", ""),
@@ -574,13 +642,15 @@ async def get_attachment(message_id: str, attachment_id: str) -> dict:
     content_bytes = full.json().get("contentBytes")
     if content_bytes is None:
         raise ValueError(
-            f"attachment {filename!r} has no downloadable content — it may be a "
+            f"attachment {filename!r} has no downloadable content - it may be a "
             f"reference (e.g. a OneDrive link) or item attachment rather than a file"
         )
-    raw = base64.b64decode(content_bytes)
-    if len(raw) > ATTACHMENT_MAX_BYTES:
+    # Decode only to validate the base64 and get the exact size; Graph already
+    # returns standard base64, so hand that back as-is instead of re-encoding.
+    size = len(base64.b64decode(content_bytes))
+    if size > ATTACHMENT_MAX_BYTES:
         raise ValueError(
-            f"attachment {filename!r} is {len(raw)} bytes, exceeds "
+            f"attachment {filename!r} is {size} bytes, exceeds "
             f"ATTACHMENT_MAX_MB ({ATTACHMENT_MAX_MB}MB) limit"
         )
 
@@ -589,18 +659,20 @@ async def get_attachment(message_id: str, attachment_id: str) -> dict:
         "messageId": message_id,
         "filename": filename,
         "mimeType": mime_type,
-        "size": len(raw),
-        "data": base64.b64encode(raw).decode(),
+        "size": size,
+        "data": content_bytes,
     }
 
 
 @mcp.tool
 async def send_email(to: str, subject: str, body: str, cc: str = "",
-                     reply_to_message_id: str = "") -> dict:
+                     reply_to_message_id: str = "", is_html: bool = False) -> dict:
     """Send an email, or reply within a conversation via reply_to_message_id.
     Replies use Graph's native reply action: subject is auto-generated ("RE: ...")
-    and body is threaded above the quoted original — no manual In-Reply-To/
-    References header construction needed, unlike Gmail."""
+    and body is threaded above the quoted original - no manual In-Reply-To/
+    References header construction needed, unlike Gmail. is_html=True sends the
+    body as HTML instead of plain text (new messages only; a reply's comment is
+    always plain text)."""
     _require_write()
     if reply_to_message_id:
         payload: dict = {"comment": body, "message": {"toRecipients": _parse_recipients(to)}}
@@ -609,16 +681,16 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
         await _call("POST", f"{ME}/messages/{_enc(reply_to_message_id)}/reply", json=payload)
         return {"sent": True, "replyTo": reply_to_message_id}
 
-    message = _build_message(subject, body, to, cc)
+    message = _build_message(subject, body, to, cc, is_html)
     await _call("POST", f"{ME}/sendMail", json={"message": message, "saveToSentItems": True})
     return {"sent": True}
 
 
 @mcp.tool
-async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
-    """Create a draft email."""
+async def create_draft(to: str, subject: str, body: str, cc: str = "", is_html: bool = False) -> dict:
+    """Create a draft email (plain text by default, HTML if is_html=True)."""
     _require_write()
-    message = _build_message(subject, body, to, cc)
+    message = _build_message(subject, body, to, cc, is_html)
     r = await _call("POST", f"{ME}/messages", json=message)
     return _draft_summary(r.json())
 
@@ -627,7 +699,7 @@ async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
 async def list_drafts(max_results: int = 10) -> list[dict]:
     """List draft emails."""
     return await _call_list("GET", f"{ME}/mailFolders/drafts/messages", params={
-        "$top": max_results,
+        "$top": _clamp_top(max_results),
         "$select": _MESSAGE_SELECT,
     })
 
@@ -642,10 +714,11 @@ async def send_draft(draft_id: str) -> dict:
 
 @mcp.tool
 async def update_draft(draft_id: str, to: str, subject: str, body: str,
-                       cc: str = "") -> dict:
-    """Replace the content of an existing draft."""
+                       cc: str = "", is_html: bool = False) -> dict:
+    """Replace the content of an existing draft (plain text by default, HTML if
+    is_html=True)."""
     _require_write()
-    message = _build_message(subject, body, to, cc)
+    message = _build_message(subject, body, to, cc, is_html)
     r = await _call("PATCH", f"{ME}/messages/{_enc(draft_id)}", json=message)
     return _draft_summary(r.json())
 
@@ -659,7 +732,7 @@ async def delete_draft(draft_id: str) -> dict:
 
 
 async def _list_child_folders(folder_id: str | None, select: str | None = None) -> list[dict]:
-    # Graph pages mailFolders results (observed: exactly 100 per page) — follow
+    # Graph pages mailFolders results (observed: exactly 100 per page) - follow
     # @odata.nextLink for the full set, or a mailbox with more children than one
     # page holds (this feature exists specifically for large mailboxes) silently
     # loses the rest with no indication to the caller that more exist.
@@ -670,7 +743,28 @@ async def _list_child_folders(folder_id: str | None, select: str | None = None) 
     return await _call_list_all("GET", url, params=params)
 
 
-_LIST_FOLDERS_MAX = 200  # hard safety cap — see docstring
+_MAX_FOLDER_DEPTH = 6  # guards against pathological nesting
+
+
+async def _walk_folders(parent_folder_id: str | None, select: str | None,
+                        recursive: bool) -> tuple[list[dict], int, bool]:
+    """Breadth-first walk shared by list_folders and count_folders. Returns
+    (every folder found, depth levels descended, truncated) where truncated means
+    the depth guard stopped the walk with folders still unexplored."""
+    folders: list[dict] = []
+    frontier = await _list_child_folders(parent_folder_id, select=select)
+    folders.extend(frontier)
+    depth = 0
+    while recursive and frontier and depth < _MAX_FOLDER_DEPTH:
+        depth += 1
+        parents = [p for p in frontier if p.get("childFolderCount", 0) > 0]
+        results = await asyncio.gather(*(_list_child_folders(p["id"], select=select) for p in parents))
+        frontier = [child for children in results for child in children]
+        folders.extend(frontier)
+    return folders, depth, bool(frontier) and depth >= _MAX_FOLDER_DEPTH
+
+
+_LIST_FOLDERS_MAX = 200  # hard safety cap - see docstring
 _LIST_FOLDERS_MINIMAL_SELECT = "id,displayName,parentFolderId,childFolderCount"
 _COUNT_FOLDERS_SELECT = "id,childFolderCount"
 
@@ -678,47 +772,35 @@ _COUNT_FOLDERS_SELECT = "id,childFolderCount"
 @mcp.tool
 async def list_folders(parent_folder_id: str = "", recursive: bool = False,
                        name_contains: str = "", minimal: bool = False) -> list[dict]:
-    """List mail folders (each item carries parentFolderId — unlike Gmail's flat
+    """List mail folders (each item carries parentFolderId - unlike Gmail's flat
     "/"-named labels, Outlook folders have a real hierarchy).
 
     By default, returns only the immediate children of the root (top-level
     folders like Inbox/Drafts/Sent Items themselves, not what's inside them).
-    parent_folder_id lists one specific folder's immediate children instead —
+    parent_folder_id lists one specific folder's immediate children instead -
     it accepts a real folder id or a well-known name ("inbox", "archive",
     "junkemail", "deleteditems", etc.), so parent_folder_id="inbox" is a common
     starting point for a mailbox organized as subfolders directly under Inbox.
     recursive=True walks the whole subtree from there (or from the root, if
     parent_folder_id is also omitted) instead of just one level. name_contains
-    filters the result by a case-insensitive substring match on displayName —
+    filters the result by a case-insensitive substring match on displayName -
     combine it with recursive=True to search the whole tree by name in one
     call (e.g. a mailbox organized into hundreds of per-project subfolders)
     instead of walking down level by level.
 
     minimal=True drops unreadItemCount/totalItemCount from each returned
-    folder, keeping only id/displayName/parentFolderId/childFolderCount — use
+    folder, keeping only id/displayName/parentFolderId/childFolderCount - use
     this with recursive=True over a large tree when you only care about
     structure or names, not per-folder unread stats, to cut the result's
     token cost. name_contains still works unchanged under minimal=True,
     since displayName is always kept. If you don't need names or ids at all
-    and just want a count, use count_folders instead — it's cheaper still.
+    and just want a count, use count_folders instead - it's cheaper still.
 
-    A mailbox can have far more folders than fit in one tool result — the
+    A mailbox can have far more folders than fit in one tool result - the
     result is capped at 200 folders regardless of the above; narrow with
     parent_folder_id/name_contains if you hit that cap."""
     select = _LIST_FOLDERS_MINIMAL_SELECT if minimal else None
-    folders: list[dict] = []
-    frontier = await _list_child_folders(parent_folder_id or None, select=select)
-    folders.extend(frontier)
-    if recursive:
-        depth = 0
-        while frontier and depth < 6:  # guards against pathological nesting
-            depth += 1
-            parents = [p for p in frontier if p.get("childFolderCount", 0) > 0]
-            results = await asyncio.gather(
-                *(_list_child_folders(p["id"], select=select) for p in parents)
-            )
-            frontier = [child for children in results for child in children]
-            folders.extend(frontier)
+    folders, _depth, _truncated = await _walk_folders(parent_folder_id or None, select, recursive)
     if name_contains:
         needle = name_contains.casefold()
         folders = [f for f in folders if needle in f.get("displayName", "").casefold()]
@@ -728,7 +810,7 @@ async def list_folders(parent_folder_id: str = "", recursive: bool = False,
 @mcp.tool
 async def count_folders(parent_folder_id: str = "") -> dict:
     """Count every folder in the mailbox (or one subtree), without returning
-    the folders themselves — for when the actual question is "how many
+    the folders themselves - for when the actual question is "how many
     folders are there", not their names or ids. Cheaper than
     list_folders(recursive=True) in two ways: each Graph request asks only
     for id/childFolderCount (not name, parent, or unread stats), and the tool
@@ -738,23 +820,12 @@ async def count_folders(parent_folder_id: str = "") -> dict:
     parent_folder_id scopes the count to one subtree (a folder id, or a
     well-known name like "inbox"), same as list_folders; omit it to count the
     whole mailbox. The walk shares list_folders' depth<6 guard against
-    pathological nesting — if that guard is hit, truncated is True and total
+    pathological nesting - if that guard is hit, truncated is True and total
     is a lower bound (folders beyond depth 6 are not counted), never a
     silently-wrong exact-looking number."""
-    total = 0
-    frontier = await _list_child_folders(parent_folder_id or None, select=_COUNT_FOLDERS_SELECT)
-    total += len(frontier)
-    depth = 0
-    while frontier and depth < 6:
-        depth += 1
-        parents = [p for p in frontier if p.get("childFolderCount", 0) > 0]
-        results = await asyncio.gather(
-            *(_list_child_folders(p["id"], select=_COUNT_FOLDERS_SELECT) for p in parents)
-        )
-        frontier = [child for children in results for child in children]
-        total += len(frontier)
-    truncated = bool(frontier) and depth >= 6
-    return {"total": total, "depth_reached": depth, "truncated": truncated}
+    folders, depth, truncated = await _walk_folders(
+        parent_folder_id or None, _COUNT_FOLDERS_SELECT, recursive=True)
+    return {"total": len(folders), "depth_reached": depth, "truncated": truncated}
 
 
 @mcp.tool
@@ -769,7 +840,7 @@ async def create_folder(display_name: str, parent_folder_id: str = "") -> dict:
 
 @mcp.tool
 async def update_folder(folder_id: str, display_name: str) -> dict:
-    """Rename a mail folder. Graph folders have no visibility options — this is
+    """Rename a mail folder. Graph folders have no visibility options - this is
     rename-only, unlike Gmail's update_label which could also change label/
     message-list visibility."""
     _require_write()
@@ -787,11 +858,11 @@ async def delete_folder(folder_id: str) -> dict:
 
 @mcp.tool
 async def move_folder(folder_id: str, destination_folder_id: str) -> dict:
-    """Move a folder — and everything in it, including its own subfolders — to
+    """Move a folder - and everything in it, including its own subfolders - to
     become a child of another folder (e.g. re-parenting a folder to live under
     Inbox). Accepts a real folder id or a well-known name ('inbox', 'archive',
     etc.) for either argument. Unlike move_message, a moved folder keeps its
-    original id (confirmed by live testing) — the id in this result will match
+    original id (confirmed by live testing) - the id in this result will match
     folder_id; only parentFolderId changes."""
     _require_write()
     r = await _call("POST", f"{ME}/mailFolders/{_enc(folder_id)}/move",
@@ -800,6 +871,7 @@ async def move_folder(folder_id: str, destination_folder_id: str) -> dict:
 
 
 _RULES = f"{ME}/mailFolders/inbox/messageRules"
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 
 @mcp.tool
@@ -814,18 +886,24 @@ async def list_rules() -> list[dict]:
 async def create_rule(display_name: str, sender_addresses: list[str], action: str,
                       destination_folder_id: str = "", mark_as_read: bool = False,
                       stop_processing: bool = True, sequence: int | None = None) -> dict:
-    """Create a server-side inbox rule matching mail from any of sender_addresses.
-    action: 'delete' (move to Deleted Items), 'move' (needs destination_folder_id;
-    folder id or well-known name) or 'mark_read_only'. Messages are only marked
-    read if mark_as_read is true (or action is 'mark_read_only'). sequence sets
-    run order; by default the rule goes after all existing ones."""
+    """Create a server-side inbox rule matching mail from any of sender_addresses
+    (exact addresses). action: 'delete' (move to Deleted Items), 'move' (needs
+    destination_folder_id, a real folder id from list_folders) or
+    'mark_read_only'. Messages are only marked read if mark_as_read is true (or
+    action is 'mark_read_only'). sequence sets run order; by default the rule
+    goes after all existing ones. Rejects a display_name already used by another
+    rule, so a repeated call can't create duplicates."""
     _require_write()
     if action not in ("delete", "move", "mark_read_only"):
         raise ValueError("action must be 'delete', 'move' or 'mark_read_only'")
     if action == "move" and not destination_folder_id:
         raise ValueError("destination_folder_id is required when action is 'move'")
-    if not sender_addresses:
+    addresses = [a.strip() for a in sender_addresses]
+    if not addresses:
         raise ValueError("sender_addresses must not be empty")
+    for a in addresses:
+        if not _EMAIL_RE.fullmatch(a):
+            raise ValueError(f"not a valid email address: {a!r}")
     actions: dict = {"stopProcessingRules": stop_processing}
     if action == "delete":
         actions["delete"] = True
@@ -833,14 +911,16 @@ async def create_rule(display_name: str, sender_addresses: list[str], action: st
         actions["moveToFolder"] = destination_folder_id
     if mark_as_read or action == "mark_read_only":
         actions["markAsRead"] = True
+    existing = await _call_list("GET", _RULES)
+    if any(x.get("displayName") == display_name for x in existing):
+        raise ValueError(f"a rule named {display_name!r} already exists - delete it or pick another name")
     if sequence is None:
-        existing = await _call_list("GET", _RULES)
         sequence = max((x.get("sequence") or 0 for x in existing), default=0) + 1
     body = {
         "displayName": display_name,
         "sequence": sequence,
         "isEnabled": True,
-        "conditions": {"fromAddresses": [{"emailAddress": {"address": a}} for a in sender_addresses]},
+        "conditions": {"fromAddresses": [{"emailAddress": {"address": a}} for a in addresses]},
         "actions": actions,
     }
     r = await _call("POST", _RULES, json=body)
@@ -857,7 +937,7 @@ async def delete_rule(rule_id: str) -> dict:
 
 @mcp.tool
 async def list_categories() -> list[dict]:
-    """List the mailbox's master category list (name + color for each tag —
+    """List the mailbox's master category list (name + color for each tag -
     the closest Outlook equivalent to a Gmail label, though categories have no
     per-tag visibility options)."""
     return await _call_list("GET", f"{ME}/outlook/masterCategories")
@@ -867,7 +947,7 @@ async def list_categories() -> list[dict]:
 async def update_categories(message_id: str, add: list[str] | None = None,
                             remove: list[str] | None = None) -> dict:
     """Add/remove categories (color-coded tags) on a message. Graph has no atomic
-    add/remove for categories, unlike Gmail's modify_labels — this reads the
+    add/remove for categories, unlike Gmail's modify_labels - this reads the
     current list, merges in add/remove, and writes the full array back, so two
     concurrent updates to the same message could race."""
     _require_write()
@@ -884,10 +964,10 @@ async def update_categories(message_id: str, add: list[str] | None = None,
 
 @mcp.tool
 async def move_message(message_id: str, destination_folder_id: str) -> dict:
-    """Move a message to another folder — accepts a folder id from list_folders,
+    """Move a message to another folder - accepts a folder id from list_folders,
     or a well-known name ('inbox', 'archive', 'junkemail', 'deleteditems', etc.).
     Graph assigns the moved message a NEW id: use the id in this result for any
-    further operations, not the original message_id — Gmail message ids never
+    further operations, not the original message_id - Gmail message ids never
     change on a label change, but Outlook message ids do change on a move."""
     _require_write()
     r = await _call("POST", f"{ME}/messages/{_enc(message_id)}/move",
@@ -897,7 +977,7 @@ async def move_message(message_id: str, destination_folder_id: str) -> dict:
 
 @mcp.tool
 async def mark_as_junk(message_id: str) -> dict:
-    """Move a message to the Junk Email folder — the closest Outlook equivalent
+    """Move a message to the Junk Email folder - the closest Outlook equivalent
     to Gmail's report_phishing (there's no separate "report to Microsoft" API;
     this just relocates the message, same as Gmail's did)."""
     _require_write()
@@ -919,12 +999,12 @@ _CALENDAR_SELECT = "id,name,color,isDefaultCalendar,canEdit,owner"
 
 # Excludes the verbose Graph event metadata (@odata.etag, iCalUId, uid,
 # transactionId, allowNewTimeProposals, reminderMinutesBeforeStart, etc.) that
-# list/search callers never use — and excludes the full HTML `body`, keeping
+# list/search callers never use - and excludes the full HTML `body`, keeping
 # only bodyPreview, same trade-off list_messages makes for mail.
 _EVENT_SELECT = ("id,subject,start,end,location,isAllDay,organizer,attendees,"
                  "bodyPreview,categories,seriesMasterId,isOnlineMeeting,onlineMeeting")
 
-# get_event is a single-item fetch (like read_message) — worth the extra body/
+# get_event is a single-item fetch (like read_message) - worth the extra body/
 # recurrence/webLink fields that list/search deliberately drop above.
 _EVENT_DETAIL_SELECT = _EVENT_SELECT + ",body,recurrence,webLink"
 
@@ -940,7 +1020,7 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
                       time_max: str = "", max_results: int = 20) -> list[dict]:
     """List calendar events in a time window (RFC3339, e.g. 2026-05-20T00:00:00Z).
     Defaults to now through +30 days if omitted. Uses Graph's calendarView, which
-    — unlike a plain events listing — correctly expands recurring events into
+    - unlike a plain events listing - correctly expands recurring events into
     their individual occurrences within the window."""
     now = datetime.now(UTC)
     start = time_min or now.isoformat()
@@ -948,7 +1028,7 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
     return await _call_list(
         "GET", f"{_calendar_base(calendar_id)}/calendarView",
         headers={"Prefer": 'outlook.timezone="UTC"'},
-        params={"startDateTime": start, "endDateTime": end, "$top": max_results,
+        params={"startDateTime": start, "endDateTime": end, "$top": _clamp_top(max_results),
                 "$select": _EVENT_SELECT})
 
 
@@ -956,11 +1036,11 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
 async def search_events(query: str, calendar_id: str = "primary",
                         max_results: int = 20) -> list[dict]:
     """Search events by keyword. Unlike list_events, this does not expand
-    recurring events into individual occurrences — it matches the recurring
+    recurring events into individual occurrences - it matches the recurring
     series itself, not each future instance."""
     return await _call_list(
         "GET", f"{_calendar_base(calendar_id)}/events",
-        params={"$search": f'"{_escape_search_phrase(query)}"', "$top": max_results,
+        params={"$search": f'"{_escape_search_phrase(query)}"', "$top": _clamp_top(max_results),
                 "$select": _EVENT_SELECT})
 
 
@@ -994,7 +1074,7 @@ async def _openid_configuration(req: Request) -> JSONResponse:
 
 
 async def _protected_resource(req: Request) -> JSONResponse:
-    # The alias this was reached through (if any) — stashed into scope["state"] by
+    # The alias this was reached through (if any) - stashed into scope["state"] by
     # _App.__call__ before the alias gets stripped for routing. Echoed back here so
     # Claude's OAuth client round-trips it as the 'resource' param on /authorize,
     # letting _authorize tell which aliased connector is authenticating.
@@ -1014,14 +1094,14 @@ async def _authorize(req: Request):
     if not p.get("code_challenge"):
         return Response("PKCE code_challenge is required", status_code=400)
     if p.get("code_challenge_method", "S256") != "S256":
-        # _pkce_ok (used at /token) always SHA-256-hashes the verifier — a
+        # _pkce_ok (used at /token) always SHA-256-hashes the verifier - a
         # client negotiating the legal but unsupported 'plain' method would
         # otherwise fail later with an opaque invalid_grant instead of a clear
         # reason. This is also what code_challenge_methods_supported declares.
         return Response("Only the S256 code_challenge_method is supported", status_code=400)
 
     # Server-verified: _App.__call__ derives this from the URL path itself
-    # (_split_alias), not from anything the client supplies — unlike the
+    # (_split_alias), not from anything the client supplies - unlike the
     # OAuth 'resource' query parameter, which a client can omit or mismatch.
     # Deciding read_only from the client-echoed resource instead of this would
     # let a client that fails to echo it correctly get a read_only=False token
@@ -1034,8 +1114,14 @@ async def _authorize(req: Request):
     read_only = alias in READ_ONLY_ALIASES
     log.info("authorize: alias=%r -> %s", alias, "read-only" if read_only else "read-write")
 
+    # /authorize is unauthenticated and reachable from the public internet (Funnel),
+    # so bound how many half-finished sign-ins can sit in memory until their TTL.
+    if len(_state_store) >= _MAX_PENDING_STATES:
+        log.warning("authorize: pending-state cap (%d) reached", _MAX_PENDING_STATES)
+        return Response("Too many pending sign-ins, try again shortly", status_code=503)
+
     # A second, independent PKCE pair for this server's own client role toward
-    # Microsoft — not required for a confidential (client-secret-bearing) client,
+    # Microsoft - not required for a confidential (client-secret-bearing) client,
     # but adds defense in depth and costs nothing extra.
     ms_verifier, ms_challenge = _new_pkce_pair()
 
@@ -1071,7 +1157,7 @@ async def _auth_callback(req: Request):
     if not state_data:
         return Response("Invalid or expired state", status_code=400)
 
-    r = await _request_with_retry("POST", MS_TOKEN_URL, data={
+    r = await _request_with_retry("POST", MS_TOKEN_URL, retry_unsafe=True, data={
         "code": req.query_params.get("code"),
         "client_id": MS_CLIENT_ID,
         "client_secret": MS_CLIENT_SECRET,
@@ -1131,6 +1217,10 @@ async def _auth_callback(req: Request):
     return RedirectResponse(f"{state_data['client_redirect_uri']}?{urlencode(params)}")
 
 
+# RFC 6749 5.1: token responses must not be cached by browsers/proxies.
+_NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
 async def _token(req: Request) -> JSONResponse:
     form = await req.form()
     # Starlette form values are `UploadFile | str`. A client posting multipart (or a
@@ -1143,7 +1233,13 @@ async def _token(req: Request) -> JSONResponse:
 
     verifier = data.get("code_verifier")
     if not verifier or not _pkce_ok(verifier, code_data["code_challenge"]):
-        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        return JSONResponse({"error": "invalid_grant"}, status_code=400, headers=_NO_STORE)
+
+    # RFC 6749 4.1.3: if the client sends redirect_uri here it must match the one
+    # used at /authorize (sending it is optional, so only compare when present).
+    sent_redirect = data.get("redirect_uri")
+    if sent_redirect and sent_redirect != code_data.get("client_redirect_uri"):
+        return JSONResponse({"error": "invalid_grant"}, status_code=400, headers=_NO_STORE)
 
     now = int(time.time())
     exp = now + 86400 * 30
@@ -1159,16 +1255,16 @@ async def _token(req: Request) -> JSONResponse:
         _token_store[code_data["jti"]]["jwt_exp"] = exp
 
     return JSONResponse({"access_token": token, "token_type": "Bearer",
-                         "expires_in": 86400 * 30})
+                         "expires_in": 86400 * 30}, headers=_NO_STORE)
 
 
-# ── Bearer auth middleware (raw ASGI — preserves ContextVar across await) ──────
+# ── Bearer auth middleware (raw ASGI - preserves ContextVar across await) ──────
 
 def _www_auth_header(alias: str) -> bytes:
     metadata_path = (f"/{alias}/.well-known/oauth-protected-resource" if alias
                      else "/.well-known/oauth-protected-resource")
     # alias comes from the request path (_split_alias) and can contain
-    # surrogate-escaped bytes if the path wasn't valid UTF-8 — replace rather
+    # surrogate-escaped bytes if the path wasn't valid UTF-8 - replace rather
     # than raise, or a single malformed request would crash with an unhandled
     # UnicodeEncodeError instead of getting the intended 401.
     return (
@@ -1195,8 +1291,8 @@ _SECURITY_HEADERS = [
 
 
 def _with_security_headers(send):
-    """Wraps an ASGI send() so every response — including ones from the mounted
-    OAuth/FastMCP sub-apps — gets standard security headers. /authorize is the one
+    """Wraps an ASGI send() so every response - including ones from the mounted
+    OAuth/FastMCP sub-apps - gets standard security headers. /authorize is the one
     point a real browser touches (the user's, round-tripping through Microsoft's
     consent screen), so this is worth doing even though most traffic is API calls."""
     async def wrapped(message):
@@ -1213,7 +1309,7 @@ _MULTI_SLASH = re.compile(r"/+")
 def _normalize_path(path: str) -> str:
     """Collapse repeated slashes (e.g. '//mcp' -> '/mcp') before any routing or
     auth-gate matching runs. Without this, a non-canonical path form matches
-    neither a known OAuth path nor the '/mcp'/'/mcp/' auth-gate check below —
+    neither a known OAuth path nor the '/mcp'/'/mcp/' auth-gate check below -
     falling through to the mounted FastMCP app with no bearer-auth check
     performed at all, relying entirely on downstream routing behavior (which
     this file has no control over) to not also treat it as equivalent."""
@@ -1222,7 +1318,7 @@ def _normalize_path(path: str) -> str:
 
 def _split_alias(path: str) -> tuple[str, str]:
     """Strip a leading /<alias> segment so /personal/mcp, /work/.well-known/... etc.
-    resolve the same as their unaliased routes — lets two Claude connectors share one
+    resolve the same as their unaliased routes - lets two Claude connectors share one
     server. Returns (alias, normalised_path); alias is "" when there wasn't one."""
     if path in _KNOWN_PATHS or path.startswith("/mcp/"):
         return "", path
@@ -1249,8 +1345,9 @@ class _App:
         self._mcp = mcp.http_app()
 
     async def __call__(self, scope, receive, send):
+        global _http_client
         if scope["type"] == "lifespan":
-            global _http_client
+            log.info("Outlook MCP proxy v%s starting", VERSION)
             _http_client = httpx.AsyncClient(timeout=HTTPX_TIMEOUT)
             try:
                 await self._mcp(scope, receive, send)
@@ -1293,9 +1390,15 @@ class _App:
                     log.warning("MCP request needs re-auth: %s", e)
                     await self._send_401(send, alias)
                     return
+                except (UpstreamUnavailable, httpx.HTTPError) as e:
+                    # Microsoft hiccup, not a dead login: 503 lets the client retry
+                    # instead of treating the session as lost and forcing re-auth.
+                    log.warning("MCP request hit a transient upstream error: %s", e)
+                    await self._send_error(send, 503, b"Upstream temporarily unavailable")
+                    return
                 except Exception:
                     log.exception("unexpected error validating MCP request")
-                    await self._send_401(send, alias)
+                    await self._send_error(send, 500, b"Internal server error")
                     return
                 _session_jti.set(payload["jti"])
                 _read_only.set(_effective_read_only(payload, alias))
@@ -1312,6 +1415,12 @@ class _App:
                     "headers": [(b"content-type", b"text/plain"),
                                 (b"www-authenticate", _www_auth_header(alias))]})
         await send({"type": "http.response.body", "body": b"Unauthorized"})
+
+    @staticmethod
+    async def _send_error(send, status: int, body: bytes) -> None:
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": body})
 
 
 app = _App()
